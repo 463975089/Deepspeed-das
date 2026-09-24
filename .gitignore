@@ -20,6 +20,7 @@ tests/test_output/*
 
 ## Ignore log files
 *.log
+lightning_logs/
 
 ## Ignore a specific generated file
 deepspeed/git_version_info_installed.py

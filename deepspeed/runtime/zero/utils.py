@@ -10,7 +10,7 @@ from typing import List, Tuple
 import torch
 from deepspeed import comm as dist
 from deepspeed.utils import logger
-from deepspeed.ops.adam import DeepSpeedCPUAdam
+from deepspeed.ops.adam import DeepSpeedCPUAdam, ZenFlowCPUAdam
 from deepspeed.ops.adagrad import DeepSpeedCPUAdagrad
 from deepspeed.ops.adam import FusedAdam
 from deepspeed.ops.lion import DeepSpeedCPULion, FusedLion
@@ -43,8 +43,8 @@ class ZeRORuntimeException(Exception):
 
 
 ZERO_SUPPORTED_OPTIMIZERS = [
-    torch.optim.Adam, torch.optim.AdamW, FusedAdam, DeepSpeedCPUAdam, torch.optim.Adagrad, DeepSpeedCPUAdagrad,
-    DeepSpeedCPULion, FusedLion
+    torch.optim.Adam, torch.optim.AdamW, FusedAdam, DeepSpeedCPUAdam, ZenFlowCPUAdam, torch.optim.Adagrad,
+    DeepSpeedCPUAdagrad, DeepSpeedCPULion, FusedLion
 ]
 
 # Add MuonWithAuxAdam to supported list if muon is installed
@@ -61,6 +61,13 @@ try:
         ZERO_SUPPORTED_OPTIMIZERS.append(apex.optimizers.FusedAdam)
 except ImportError:
     pass
+
+
+def get_norm_dtype():
+    """Gradient norms accumulate in fp64 for accuracy, except on devices without fp64 (e.g. MPS)."""
+    if get_accelerator().is_fp64_supported():
+        return torch.double
+    return torch.float
 
 
 def is_zero_supported_optimizer(optimizer):
@@ -150,7 +157,7 @@ def apply_to_tensors_only(function, value, warning_msg_fn=None):
     Apply `function` to every Tensor in `value`.
 
     Args:
-        functional: The function class to apply.
+        function: The function class to apply.
         value (Any): Target object to apply `function` to.
 
     Returns:

@@ -53,13 +53,34 @@ def installed_cuda_version(name=""):
     if cuda_home is None:
         raise MissingCUDAException("CUDA_HOME does not exist, unable to compile CUDA op(s)")
     # Ensure there is not a cuda version mismatch between torch and nvcc compiler
-    output = subprocess.check_output([cuda_home + "/bin/nvcc", "-V"], universal_newlines=True)
+    nvcc = cuda_home + "/bin/nvcc"
+    try:
+        output = subprocess.check_output([nvcc, "-V"], universal_newlines=True)
+    except (OSError, subprocess.SubprocessError) as err:
+        # CUDA_HOME can point at a runtime only install, which has no nvcc to compile with. Report that
+        # the same way as a missing CUDA_HOME so the callers that already fall back can handle it.
+        raise MissingCUDAException(f"Unable to run {nvcc}, unable to compile CUDA op(s): {err}") from err
     output_split = output.split()
     release_idx = output_split.index("release")
     release = output_split[release_idx + 1].replace(',', '').split(".")
     # Ignore patch versions, only look at major + minor
     cuda_major, cuda_minor = release[:2]
     return int(cuda_major), int(cuda_minor)
+
+
+def probe_is_compatible(builder, verbose=False):
+    """Report whether an op can be built, treating a probe that itself fails as "not compatible".
+
+    Compatibility is probed for every op when deepspeed is imported, whether or not the caller will ever
+    build that op. A CUDA op builder on a machine that has a GPU but no CUDA toolkit raises
+    MissingCUDAException from its probe, which would otherwise make importing deepspeed fail outright
+    over an op that was never asked for. See #7452.
+    """
+    try:
+        return builder.is_compatible(verbose)
+    except Exception as err:
+        print(f"{WARNING} {builder.name} compatibility check failed ({err}), treating the op as not compatible")
+        return False
 
 
 def get_default_compute_capabilities():
@@ -485,6 +506,10 @@ class OpBuilder(ABC):
             cpu_info['arch'] = "PPC_"
         elif 'riscv64' in result:
             cpu_info['arch'] = "riscv64"
+        elif 'aarch64' in result:
+            cpu_info['arch'] = "ARM_8"
+            if ' sve ' in result:
+                cpu_info['flags'] = 'sve'
 
         return cpu_info
 
@@ -510,6 +535,12 @@ class OpBuilder(ABC):
                 return '-D__AVX512__'
             elif 'avx2' in cpu_info['flags']:
                 return '-D__AVX256__'
+        elif (cpu_info['arch'] or '').startswith('ARM') and 'sve' in cpu_info['flags']:
+            return '-D__SVE__'
+        elif cpu_info['arch'] == 'ARM_8':
+            # NEON is baseline on AArch64; vdivq/vsqrtq used by simd.h are A64-only,
+            # so do not advertise it for 32-bit ARM.
+            return '-D__NEON__'
         return '-D__SCALAR__'
 
     def command_exists(self, cmd):
@@ -638,6 +669,24 @@ class OpBuilder(ABC):
 
 
 class CUDAOpBuilder(OpBuilder):
+
+    def cuda_capability_major(self):
+        """Compute-capability major of CUDA device 0, or ``None`` when it cannot
+        be read without side effects.
+
+        ``torch.cuda.get_device_properties`` calls ``torch.cuda._lazy_init()``,
+        which creates a CUDA context. Doing that merely to check op compatibility
+        at ``import deepspeed`` time would poison ``fork()``-based multiprocessing,
+        because a forked child cannot reuse the parent's context (issue #7918).
+        We therefore probe only when a context already exists and we are not
+        inside such a forked child; otherwise the caller skips the
+        compute-capability check and defers it to build/load time.
+        """
+        if not torch.cuda.is_initialized():
+            return None
+        if hasattr(torch.cuda, '_is_in_bad_fork') and torch.cuda._is_in_bad_fork():
+            return None
+        return torch.cuda.get_device_properties(0).major
 
     def compute_capability_args(self, cross_compile_archs=None):
         """
@@ -850,7 +899,8 @@ class CUDAOpBuilder(OpBuilder):
         if sys.platform == "win32":
             return ['-O2']
         else:
-            return ['-O3', '-std=c++17', '-g', '-Wno-reorder']
+            cpp_standard = '-std=c++20' if (TORCH_MAJOR, TORCH_MINOR) >= (2, 12) else '-std=c++17'
+            return ['-O3', cpp_standard, '-g', '-Wno-reorder']
 
     def nvcc_args(self):
         if self.build_for_cpu:
@@ -875,7 +925,7 @@ class CUDAOpBuilder(OpBuilder):
 
             cuda_major, cuda_minor = installed_cuda_version()
             if cuda_major > 10:
-                if cuda_major == 12 and cuda_minor >= 5:
+                if (cuda_major == 12 and cuda_minor >= 5) or cuda_major >= 13:
                     std_lib = '-std=c++20'
                 else:
                     std_lib = '-std=c++17'

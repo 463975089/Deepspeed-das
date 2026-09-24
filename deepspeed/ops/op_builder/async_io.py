@@ -31,7 +31,7 @@ class AsyncIOBuilder(TorchCPUOpBuilder):
             'csrc/aio/common/deepspeed_aio_utils.cpp', 'csrc/aio/common/deepspeed_aio_common.cpp',
             'csrc/aio/common/deepspeed_aio_types.cpp', 'csrc/aio/py_lib/deepspeed_cpu_op.cpp',
             'csrc/aio/py_lib/deepspeed_aio_op_desc.cpp', 'csrc/aio/py_lib/deepspeed_py_copy.cpp',
-            'csrc/aio/py_lib/deepspeed_pin_tensor.cpp'
+            'csrc/aio/py_lib/deepspeed_pin_tensor_client.cpp'
         ]
         return src_list
 
@@ -50,8 +50,10 @@ class AsyncIOBuilder(TorchCPUOpBuilder):
                 os.path.join(torch.utils.cpp_extension.ROCM_HOME, "include", "rocrand"),
                 os.path.join(torch.utils.cpp_extension.ROCM_HOME, "include", "hiprand"),
             ]
-        return ['csrc/aio/py_lib', 'csrc/aio/common'] + CUDA_INCLUDE + ["third_party/libaio_build/include"]
-
+        # 'third_party/libaio_build/include' carries the libaio headers shipped for the
+        # DCU/DTK image, where the system libaio-dev package is not installed.
+        return ['csrc/aio/py_lib', 'csrc/aio/common', 'csrc/pin_memory'
+                ] + CUDA_INCLUDE + ['third_party/libaio_build/include']
 
     def cxx_args(self):
         # -O0 for improved debugging, since performance is bound by I/O
@@ -97,6 +99,13 @@ class AsyncIOBuilder(TorchCPUOpBuilder):
                     self.warning(f"{self.NAME}: please install the {lib} package with {tool}")
                 break
         return found
+
+    def load(self, verbose=False):
+        # Pin manager is compiled only into pin_memory; load it first so aio can
+        # resolve the shared manager (and related symbols) across .so boundaries.
+        from .pin_memory import PinMemoryBuilder
+        PinMemoryBuilder().load(verbose=verbose)
+        return super().load(verbose=verbose)
 
     def is_compatible(self, verbose=False):
         # Check for the existence of libaio by using distutils

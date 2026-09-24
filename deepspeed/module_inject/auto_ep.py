@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 import re
 from collections import OrderedDict
-from typing import Literal
+from typing import Callable, TYPE_CHECKING, Literal
 
 import torch
 import torch.nn as nn
@@ -33,7 +33,11 @@ from deepspeed.module_inject.auto_ep_presets.registry import (
     unsupported_preset_for_hf_model_type,
 )
 from deepspeed.moe.fused_expert_layout import classify_fused_gate_up_layout
+from deepspeed.runtime.zero.utils import is_zero_param
 from deepspeed.utils import logger
+
+if TYPE_CHECKING:
+    from deepspeed.module_inject.auto_ep_layer import ReplacementSourceMap
 
 
 def _remove_transformers_output_capture_hooks(model: nn.Module) -> int:
@@ -81,6 +85,29 @@ def _raise_if_duplicate_moe_specs(specs: list[MoELayerSpec]) -> None:
                      "AutoEP patterns so each MoE module matches exactly one preset.")
 
 
+def _resolve_e_score_correction_bias_path(moe_module: nn.Module, module_name: str) -> str | None:
+    matches = [
+        path for path, candidate in moe_module.named_modules()
+        if getattr(candidate, "e_score_correction_bias", None) is not None
+    ]
+    if len(matches) > 1:
+        locations = ", ".join(repr(path or "<root>") for path in matches)
+        raise ValueError(
+            f"AutoEP found e_score_correction_bias in multiple locations in layer '{module_name}': {locations}. "
+            "Keep exactly one score correction bias in each MoE layer so AutoEP can preserve it unambiguously.")
+    return matches[0] if matches else None
+
+
+def _source_param_shape(param: torch.Tensor | nn.Parameter) -> torch.Size:
+    if is_zero_param(param):
+        return torch.Size(param.ds_shape)
+    return torch.Size(param.shape)
+
+
+def _source_param_ndim(param: torch.Tensor | nn.Parameter) -> int:
+    return len(_source_param_shape(param))
+
+
 def _has_3d_expert_params(module: nn.Module, preset: MoEModelPreset) -> bool:
     """Check if module stores expert weights as 3D parameter tensors (transformers 5.0.0+).
 
@@ -92,7 +119,7 @@ def _has_3d_expert_params(module: nn.Module, preset: MoEModelPreset) -> bool:
     if param is None:
         return False
     if isinstance(param, nn.Parameter) or isinstance(param, torch.Tensor):
-        return param.ndim == 3
+        return _source_param_ndim(param) == 3
     return False
 
 
@@ -146,7 +173,7 @@ def _detect_expert_storage(experts_module: nn.Module, preset: MoEModelPreset) ->
         return "module_list"
     # Check children for 3D params as fallback
     for name, param in experts_module.named_parameters(recurse=False):
-        if param.ndim == 3:
+        if _source_param_ndim(param) == 3:
             return "fused_3d"
     return "module_list"
 
@@ -162,13 +189,15 @@ def _infer_hidden_and_ffn_size(
         w1_param = getattr(experts_module, preset.expert_w1, None)
         w2_param = getattr(experts_module, preset.expert_w2, None)
         if w1_param is not None and w2_param is not None:
+            w1_shape = _source_param_shape(w1_param)
+            w2_shape = _source_param_shape(w2_param)
             if preset.expert_w3 is None:
-                layout = classify_fused_gate_up_layout(tuple(w1_param.shape), tuple(w2_param.shape))
+                layout = classify_fused_gate_up_layout(tuple(w1_shape), tuple(w2_shape))
                 if layout is None:
                     raise ValueError("expert_w3=None expects fused gate+up weights with either "
                                      f"[E, 2*ffn, hidden]/[E, hidden, ffn] or [E, hidden, 2*ffn]/[E, ffn, hidden], "
-                                     f"but got {preset.expert_w1}={tuple(w1_param.shape)} and "
-                                     f"{preset.expert_w2}={tuple(w2_param.shape)}.")
+                                     f"but got {preset.expert_w1}={tuple(w1_shape)} and "
+                                     f"{preset.expert_w2}={tuple(w2_shape)}.")
                 hidden_size = layout.hidden_size
                 ffn_hidden_size = layout.ffn_hidden_size
             else:
@@ -177,8 +206,8 @@ def _infer_hidden_and_ffn_size(
                 if w3_param is None:
                     raise ValueError(f"expert_w3='{preset.expert_w3}' is set but no such weight "
                                      f"exists on experts module.")
-                hidden_size = w1_param.shape[2]
-                ffn_hidden_size = w1_param.shape[1]
+                hidden_size = w1_shape[2]
+                ffn_hidden_size = w1_shape[1]
             return hidden_size, ffn_hidden_size
     elif storage == "module_list":
         # Legacy: individual expert modules
@@ -195,8 +224,9 @@ def _infer_hidden_and_ffn_size(
                 if isinstance(w1, nn.Linear):
                     return w1.in_features, w1.out_features
                 elif isinstance(w1, (nn.Parameter, torch.Tensor)):
-                    if w1.ndim == 2:
-                        return w1.shape[1], w1.shape[0]
+                    w1_shape = _source_param_shape(w1)
+                    if len(w1_shape) == 2:
+                        return w1_shape[1], w1_shape[0]
 
     raise ValueError(f"Could not infer hidden_size/ffn_hidden_size from experts module "
                      f"with storage={storage}, preset.expert_w1={preset.expert_w1}")
@@ -327,12 +357,13 @@ class AutoEP:
 
                 # Validate/derive from router weight shape
                 router_weight = getattr(router_child, 'weight', None)
-                if router_weight is not None and router_weight.ndim == 2:
-                    num_experts_from_weight = router_weight.shape[0]
-                    hidden_from_weight = router_weight.shape[1]
+                router_weight_shape = _source_param_shape(router_weight) if router_weight is not None else None
+                if router_weight_shape is not None and len(router_weight_shape) == 2:
+                    num_experts_from_weight = router_weight_shape[0]
+                    hidden_from_weight = router_weight_shape[1]
                     if num_experts is not None and num_experts != num_experts_from_weight:
                         raise ValueError(f"Config num_experts={num_experts} mismatches router weight "
-                                         f"shape {router_weight.shape} (expected {num_experts_from_weight}) "
+                                         f"shape {router_weight_shape} (expected {num_experts_from_weight}) "
                                          f"in layer '{module_name}'")
                     num_experts = num_experts_from_weight
 
@@ -359,10 +390,10 @@ class AutoEP:
                     continue
 
                 # Cross-validate hidden_size with router
-                if router_weight is not None and router_weight.ndim == 2:
-                    if hidden_size != router_weight.shape[1]:
+                if router_weight_shape is not None and len(router_weight_shape) == 2:
+                    if hidden_size != router_weight_shape[1]:
                         raise ValueError(f"hidden_size={hidden_size} from expert weights mismatches "
-                                         f"router weight dim={router_weight.shape[1]} in '{module_name}'")
+                                         f"router weight dim={router_weight_shape[1]} in '{module_name}'")
 
                 # Validate top_k <= num_experts
                 if top_k > num_experts:
@@ -398,6 +429,7 @@ class AutoEP:
                     gate_bias = getattr(router_child, 'bias', None) is not None
 
                 forward_contract = adapter.adjust_forward_contract(_detect_forward_contract(module, router_child))
+                e_score_correction_bias_path = _resolve_e_score_correction_bias_path(module, module_name)
 
                 # Check shared experts
                 has_shared = False
@@ -457,6 +489,7 @@ class AutoEP:
                     preset_adapter=preset.preset_adapter,
                     router_logits_capture_mode=forward_contract.router_logits_capture_mode,
                     moe_output_shape=forward_contract.moe_output_shape,
+                    e_score_correction_bias_path=e_score_correction_bias_path,
                 )
                 specs.append(spec)
                 logger.debug(f"Detected MoE layer: {module_name} (family={preset_name}, "
@@ -476,8 +509,10 @@ class AutoEP:
         spec: MoELayerSpec,
         ep_size: int,
         ep_rank: int,
-    ) -> nn.Module:
-        from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer
+        collect_sources: bool = False,
+    ) -> tuple[nn.Module, "ReplacementSourceMap"]:
+        from deepspeed.module_inject.auto_ep_layer import (AutoEPMoELayer, ReplacementSourceMap,
+                                                           collect_replacement_sources)
 
         # Navigate to the parent module and get the child name
         parts = spec.moe_module_name.split(".")
@@ -496,9 +531,14 @@ class AutoEP:
             config=self.config,
         )
 
+        # Collected before the source module leaves the tree, and only when a caller-supplied
+        # optimizer needs it: the values are the discarded pre-shard expert weights.
+        sources = (collect_replacement_sources(source_module, replacement, spec, ep_size, ep_rank)
+                   if collect_sources else ReplacementSourceMap())
+
         # Replace in-place on parent
         setattr(parent, child_name, replacement)
-        return replacement
+        return replacement, sources
 
     def _retarget_transformers_output_recorders(self, spec: MoELayerSpec, replacement: nn.Module) -> None:
         adapter = get_preset_adapter(spec.preset_adapter)
@@ -517,7 +557,7 @@ class AutoEP:
         ep_rank: int,
     ) -> None:
         """Replace a single MoE module with AutoEPMoELayer in-place on the model."""
-        replacement = self._replace_moe_layer_without_retarget(spec, ep_size, ep_rank)
+        replacement, _ = self._replace_moe_layer_without_retarget(spec, ep_size, ep_rank)
         self._retarget_transformers_output_recorders(spec, replacement)
 
         logger.info(f"AutoEP: replaced '{spec.moe_module_name}' with AutoEPMoELayer "
@@ -529,11 +569,28 @@ class AutoEP:
         specs: list[MoELayerSpec],
         ep_size: int,
         ep_rank: int,
-    ) -> None:
-        """Replace multiple MoE modules and batch post-replacement recorder retargeting."""
+        collect_sources: bool = False,
+        on_moe_layer_replaced: Callable[[nn.Module], None] | None = None,
+    ) -> "ReplacementSourceMap":
+        """Replace multiple MoE modules and batch post-replacement recorder retargeting.
+
+        With ``collect_sources``, returns a ``ReplacementSourceMap``: the source parameters behind
+        each replacement parameter, so a caller-supplied optimizer can put each replacement back
+        into the param group its sources belonged to, plus the identity of every parameter the
+        replacement detached, so the same optimizer can drop exactly those. The source values are
+        the discarded pre-shard expert weights and stay alive until the engine has finished the
+        remap, so the caller asks for them only when there is such an optimizer. Otherwise the map
+        is empty and each source module is freed as its replacement takes its place.
+        """
+        from deepspeed.module_inject.auto_ep_layer import ReplacementSourceMap
+
         replacements: list[tuple[MoELayerSpec, nn.Module]] = []
+        replacement_sources = ReplacementSourceMap()
         for spec in specs:
-            replacement = self._replace_moe_layer_without_retarget(spec, ep_size, ep_rank)
+            replacement, sources = self._replace_moe_layer_without_retarget(spec, ep_size, ep_rank, collect_sources)
+            replacement_sources.update(sources)
+            if on_moe_layer_replaced is not None:
+                on_moe_layer_replaced(replacement)
             replacements.append((spec, replacement))
             logger.info(f"AutoEP: replaced '{spec.moe_module_name}' with AutoEPMoELayer "
                         f"(ep_size={ep_size}, ep_rank={ep_rank}, "
@@ -546,6 +603,8 @@ class AutoEP:
 
         for spec, replacement in retarget_groups.values():
             self._retarget_transformers_output_recorders(spec, replacement)
+
+        return replacement_sources
 
     def _apply_config_overrides(self, preset: MoEModelPreset) -> MoEModelPreset:
         return apply_config_overrides(self.config, preset)

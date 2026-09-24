@@ -28,6 +28,7 @@ from enum import Enum
 from deepspeed.runtime.config_utils import DeepSpeedConfigObject
 from deepspeed import comm as dist
 from deepspeed.utils import logger
+from deepspeed.runtime.utils import has_inf_or_nan
 
 INITIAL_LOSS_SCALE = 'init_scale'
 SCALE_WINDOW = 'scale_window'
@@ -206,7 +207,6 @@ class DynamicLossScaler(LossScalerBase):
 
     Args:
         init_scale (float, optional, default=2**32):  Initial loss scale attempted by :class:`DynamicLossScaler.`
-        scale_factor (float, optional, default=2.0):  Factor used when adjusting the loss scale. If an overflow is encountered, the loss scale is readjusted to loss scale/``scale_factor``.  If ``scale_window`` consecutive iterations take place without an overflow, the loss scale is readjusted to loss_scale*``scale_factor``.
         scale_window (int, optional, default=1000):  Number of consecutive iterations without an overflow to wait before increasing the loss scale.
         consecutive_hysteresis (bool, optional, default=False): Whether to refill hysteresis if we reach an iteration that doesn't overflow
     """
@@ -242,24 +242,7 @@ class DynamicLossScaler(LossScalerBase):
 
     # `x` is a torch.Tensor
     def _has_inf_or_nan(x):
-        try:
-            # if x is half, the .float() incurs an additional deep copy, but it's necessary if
-            # Pytorch's .sum() creates a one-element tensor of the same type as x
-            # (which is true for some recent version of pytorch).
-            cpu_sum = float(x.float().sum())
-            # More efficient version that can be used if .sum() returns a Python scalar
-            # cpu_sum = float(x.sum())
-        except RuntimeError as instance:
-            # We want to check if inst is actually an overflow exception.
-            # RuntimeError could come from a different error.
-            # If so, we still want the exception to propagate.
-            if "value cannot be converted" not in instance.args[0]:
-                raise
-            return True
-        else:
-            if cpu_sum in [float('inf'), -float('inf')] or cpu_sum != cpu_sum:
-                return True
-            return False
+        return has_inf_or_nan(x)
 
     # `overflow` is boolean indicating whether the gradient overflowed
     def update_scale(self, overflow):

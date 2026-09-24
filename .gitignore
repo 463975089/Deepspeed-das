@@ -1,6 +1,9 @@
 ## Ignore Python compiled files
 *.pyc
 
+## Output of the diff-based test selector (ci/tests_fetcher.py)
+ci/.test_selection/
+
 ## Ignore IDE-specific files and directories
 # JetBrains IDE settings
 .idea/
@@ -58,7 +61,7 @@ tests/unit/saved_checkpoint/
 *_hip.cpp
 *_hip.h
 *.hip
-*.cuh
+*_hip.cuh
 *hip_layers.h
 
 # virtual env directory for format

@@ -20,12 +20,16 @@ import torch
 import torch.nn as nn
 import deepspeed.comm as dist
 from deepspeed.module_inject.auto_ep_config import AutoEPConfig, MoELayerSpec, resolve_autoep_config_defaults
+from deepspeed.module_inject.auto_ep_folding import mark_autoep_folding_router_parameter
+from deepspeed.ops.triton_ops import autoep_fused_token_ops as fused_token_ops
 from deepspeed.utils import logger
+from deepspeed.module_inject.auto_ep_comm import (DEEPEP_BACKEND, DeepEPExchange, assert_dtype_supported,
+                                                  deepep_combine, deepep_dispatch)
 from deepspeed.moe.ep_router import TokenChoiceTopKRouter
 from deepspeed.moe.ep_count import count_tokens_per_expert
 from deepspeed.moe.ep_experts import GroupedExperts
-from deepspeed.moe.ep_kernels import TokenReorderer
-from deepspeed.moe.ep_repack import repack_expert_requires_grad_flags, repack_expert_weights
+from deepspeed.moe.ep_repack import (_gather_source_zero_params, repack_expert_requires_grad_flags,
+                                     repack_expert_source_params, repack_expert_weights)
 
 # ---------------------------------------------------------------------------
 # Named tuples
@@ -61,7 +65,8 @@ def resolve_score_apply_mode(
 
 
 def resolve_combine_impl(
-    config_override: Literal["auto", "weighted_sum", "legacy_bmm"], ) -> Literal["weighted_sum", "legacy_bmm"]:
+    config_override: Literal["auto", "weighted_sum", "fused_weighted_sum", "legacy_bmm"],
+) -> Literal["weighted_sum", "fused_weighted_sum", "legacy_bmm"]:
     """Resolve combine implementation from config override or default."""
     if config_override != "auto":
         return config_override
@@ -69,9 +74,43 @@ def resolve_combine_impl(
 
 
 def _copy_parameter_data(target: nn.Parameter, source: torch.Tensor) -> None:
+    full_shape = torch.Size(getattr(source, "ds_shape", source.shape))
     with torch.no_grad():
-        target.data = torch.empty_like(source.data)
-        target.data.copy_(source.data)
+        source_data = source.data
+        if torch.Size(source_data.shape) != full_shape:
+            raise RuntimeError("AutoEP source parameter must be gathered before copying: "
+                               f"expected full shape {tuple(full_shape)}, got {tuple(source_data.shape)}")
+        if (torch.Size(target.data.shape) != full_shape or target.data.dtype != source_data.dtype
+                or target.data.device != source_data.device):
+            target.data = torch.empty(full_shape, dtype=source_data.dtype, device=source_data.device)
+        target.data.copy_(source_data)
+
+
+def _copy_e_score_correction_bias(
+    target_router: nn.Module,
+    source_owner: nn.Module,
+    source_bias,
+    source_path: str,
+) -> None:
+    if isinstance(source_bias, nn.Parameter):
+        target_router.e_score_correction_bias = nn.Parameter(source_bias.data.clone(),
+                                                             requires_grad=source_bias.requires_grad)
+    elif (torch.is_tensor(source_bias) and source_owner._buffers.get("e_score_correction_bias") is source_bias):
+        copied_bias = source_bias.detach().clone()
+        copied_bias.requires_grad_(source_bias.requires_grad)
+        if hasattr(target_router, "e_score_correction_bias"):
+            delattr(target_router, "e_score_correction_bias")
+        persistent = "e_score_correction_bias" not in source_owner._non_persistent_buffers_set
+        target_router.register_buffer("e_score_correction_bias", copied_bias, persistent=persistent)
+    else:
+        logger.warning(
+            "AutoEP: cannot copy e_score_correction_bias from source module path '%s': expected "
+            "an nn.Parameter or registered buffer, got %s.", source_path or "<root>",
+            type(source_bias).__name__)
+        return
+
+    logger.info("AutoEP: copied e_score_correction_bias from source module path '%s' (shape=%s)", source_path
+                or "<root>", source_bias.shape)
 
 
 def apply_scores_before_experts_if_enabled(
@@ -85,27 +124,69 @@ def apply_scores_before_experts_if_enabled(
     return routed_input
 
 
-def compute_split_plan(
-    selected_experts: torch.Tensor,  # [T, K]
-    num_experts: int,
+def _split_plan_from_expert_counts(
+    num_tokens_per_expert: torch.Tensor,  # [E_global], int32
     ep_size: int,
     num_local_experts: int,
     ep_group: dist.ProcessGroup | None,
 ) -> SplitPlan:
+    """Build a SplitPlan from a global per-expert token histogram (ep_size > 1).
+
+    A single all-to-all exchanges the whole ``[ep_size, E_local]`` count matrix.
+    Row ``s`` of the received matrix holds the per-local-expert counts sent by
+    source rank ``s``, so summing it over experts recovers exactly the per-rank
+    totals that a separate rank-count exchange would have produced.
+    """
+    count_matrix = num_tokens_per_expert.view(ep_size, num_local_experts)
+
+    send_counts = count_matrix.reshape(-1).contiguous()  # [ep_size * E_local]
+    received_counts_flat = torch.empty_like(send_counts)
+    dist.all_to_all_single(
+        received_counts_flat,
+        send_counts,
+        group=ep_group,
+    )
+    received_counts = received_counts_flat.view(ep_size, num_local_experts)
+
+    # input_splits: tokens THIS rank sends to each destination rank.
+    # output_splits: tokens THIS rank receives from each source rank.
+    # Stacked so both split lists share a single device-to-host sync.
+    input_splits, output_splits = torch.stack((
+        count_matrix.sum(dim=1),
+        received_counts.sum(dim=1),
+    )).cpu().tolist()
+
+    return SplitPlan(
+        input_splits=input_splits,
+        output_splits=output_splits,
+        local_counts=received_counts.sum(dim=0),  # [E_local]
+        local_counts_by_source=received_counts,
+    )
+
+
+def compute_split_plan(
+        selected_experts: torch.Tensor,  # [T, K]
+        num_experts: int,
+        ep_size: int,
+        num_local_experts: int,
+        ep_group: dist.ProcessGroup | None,
+        num_tokens_per_expert: torch.Tensor | None = None,  # [E_global], int32
+) -> SplitPlan:
     """Compute AllToAllV split sizes for token dispatch/combine.
+
+    ``num_tokens_per_expert`` may be supplied by the caller to reuse the
+    histogram already computed by the router; when omitted it is derived from
+    ``selected_experts``.
 
     Returns SplitPlan with input_splits, output_splits, local_counts, and
     local_counts_by_source.
     """
-    T_K = selected_experts.numel()
+    if num_tokens_per_expert is None:
+        num_tokens_per_expert = count_tokens_per_expert(selected_experts, num_experts)
 
     if ep_size == 1:
         # No dispatch needed - all tokens stay local
-        num_tokens_per_expert = count_tokens_per_expert(
-            selected_experts,
-            num_experts,
-            out_dtype=torch.int32,
-        )
+        T_K = selected_experts.numel()
         return SplitPlan(
             input_splits=[T_K],
             output_splits=[T_K],
@@ -113,56 +194,23 @@ def compute_split_plan(
             local_counts_by_source=num_tokens_per_expert.view(1, num_local_experts),
         )
 
-    # Count tokens per expert globally
-    num_tokens_per_expert = count_tokens_per_expert(
-        selected_experts,
-        num_experts,
-        out_dtype=torch.int32,
-    )
+    return _split_plan_from_expert_counts(num_tokens_per_expert, ep_size, num_local_experts, ep_group)
 
-    # Reshape to [ep_size, num_local_experts] to get per-rank counts
-    count_matrix = num_tokens_per_expert.view(ep_size, num_local_experts)
 
-    # input_splits: how many tokens THIS rank sends to each destination rank
-    input_splits = count_matrix.sum(dim=1).cpu().tolist()
+def compute_split_plan_from_expert_indices(
+    expert_indices: torch.Tensor,
+    num_experts: int,
+    ep_size: int,
+    num_local_experts: int,
+    ep_group: dist.ProcessGroup | None,
+) -> SplitPlan:
+    """Compute EP AllToAllV splits for an already partitioned assignment list."""
+    counts = count_tokens_per_expert(expert_indices, num_experts)
+    if ep_size == 1:
+        return SplitPlan([int(expert_indices.numel())], [int(expert_indices.numel())], counts,
+                         counts.view(1, num_local_experts))
 
-    # Exchange counts with all ranks to get output_splits
-    # Each rank tells every other rank how many tokens it will send
-    local_counts_tensor = count_matrix.sum(dim=1).clone()  # [ep_size]
-    remote_counts_tensor = torch.zeros_like(local_counts_tensor)
-
-    dist.all_to_all_single(
-        remote_counts_tensor,
-        local_counts_tensor,
-        group=ep_group,
-    )
-    output_splits = remote_counts_tensor.cpu().tolist()
-
-    # local_counts: how many tokens this rank will process for each local expert
-    # After receiving tokens, we need per-expert counts for this rank
-    local_expert_counts = count_matrix[:, :].clone()  # [ep_size, E_local]
-
-    # Exchange the detailed per-expert counts
-    # Each rank needs to know, for its local experts, how many tokens come from each source
-    local_expert_counts_flat = local_expert_counts.view(-1).contiguous()  # [ep_size * E_local]
-    received_counts_flat = torch.zeros_like(local_expert_counts_flat)
-
-    dist.all_to_all_single(
-        received_counts_flat,
-        local_expert_counts_flat,
-        group=ep_group,
-    )
-
-    # Sum over source ranks to get total per local expert
-    received_counts = received_counts_flat.view(ep_size, num_local_experts)
-    local_counts = received_counts.sum(dim=0)  # [E_local]
-
-    return SplitPlan(
-        input_splits=input_splits,
-        output_splits=output_splits,
-        local_counts=local_counts,
-        local_counts_by_source=received_counts,
-    )
+    return _split_plan_from_expert_counts(counts, ep_size, num_local_experts, ep_group)
 
 
 class _AllToAllV(torch.autograd.Function):
@@ -361,6 +409,7 @@ class AutoEPMoELayer(nn.Module):
         self.top_k = spec.top_k
         self.score_apply = resolve_score_apply_mode(spec, config.score_apply)
         self.combine_impl = resolve_combine_impl(config.combine_impl)
+        self._fused_combine_checked = False
         route_norm = spec.route_norm if config.route_norm is None else config.route_norm
         self.ep_size = ep_size
         self.ep_rank = ep_rank
@@ -369,47 +418,59 @@ class AutoEPMoELayer(nn.Module):
         self.hidden_size = spec.hidden_size
         self.ep_group_name = f"ep_size_{ep_size}"
         self.ep_group = None  # Set by set_deepspeed_parallelism()
+        self.folding_group_handles = None
+        self.tp_group = None
         resolved_config = resolve_autoep_config_defaults(config, spec.model_family)
+        self.validate_folding_routing = bool(resolved_config.validate_folding_routing)
 
         # Router: copy gate weights from source
         source_gate = getattr(source_module, spec.router_name)
+        source_gate_bias = getattr(source_gate, 'bias', None)
+        source_ecb_path = spec.e_score_correction_bias_path
+        if source_ecb_path is None:
+            source_ecb_owner = source_gate
+            source_ecb_path = spec.router_name
+        else:
+            source_ecb_owner = (source_module
+                                if source_ecb_path == "" else source_module.get_submodule(source_ecb_path))
+        source_ecb = getattr(source_ecb_owner, "e_score_correction_bias", None)
+        unsupported_router_biases = [
+            getattr(source_gate, bias_name, None) for bias_name in spec.unsupported_router_bias_names
+        ]
         if not spec.supports_expert_bias and resolved_config.load_balance_coeff is not None:
             raise ValueError(f"AutoEP preset '{spec.model_family}' does not support load_balance_coeff/expert_bias "
                              "yet. Set load_balance_coeff=None.")
-        for bias_name in spec.unsupported_router_bias_names:
-            router_bias = getattr(source_gate, bias_name, None)
-            if router_bias is None:
-                continue
-            if torch.is_tensor(router_bias) and torch.count_nonzero(router_bias.detach()).item() == 0:
-                continue
-            raise ValueError(f"AutoEP preset '{spec.model_family}' does not support nonzero router bias "
-                             f"'{bias_name}' yet.")
-        self.router = TokenChoiceTopKRouter(
-            dim=spec.hidden_size,
-            num_experts=spec.num_experts,
-            num_expert_groups=spec.num_expert_groups,
-            num_limited_groups=spec.num_limited_groups,
-            top_k=spec.top_k,
-            score_func=spec.score_func,
-            route_norm=route_norm,
-            route_scale=spec.route_scale,
-            gate_bias=spec.gate_bias,
-            group_score_func=spec.group_score_func,
-        )
-        # Copy gate weights
-        _copy_parameter_data(self.router.gate.weight, source_gate.weight)
-        self.router.gate.weight.requires_grad_(source_gate.weight.requires_grad)
-        if spec.gate_bias and getattr(source_gate, 'bias', None) is not None:
-            _copy_parameter_data(self.router.gate.bias, source_gate.bias)
-            self.router.gate.bias.requires_grad_(source_gate.bias.requires_grad)
+        with _gather_source_zero_params([source_gate.weight, source_gate_bias, source_ecb,
+                                         *unsupported_router_biases]):
+            for bias_name, router_bias in zip(spec.unsupported_router_bias_names, unsupported_router_biases):
+                if router_bias is None:
+                    continue
+                if torch.is_tensor(router_bias) and torch.count_nonzero(router_bias.detach()).item() == 0:
+                    continue
+                raise ValueError(f"AutoEP preset '{spec.model_family}' does not support nonzero router bias "
+                                 f"'{bias_name}' yet.")
+            self.router = TokenChoiceTopKRouter(
+                dim=spec.hidden_size,
+                num_experts=spec.num_experts,
+                num_expert_groups=spec.num_expert_groups,
+                num_limited_groups=spec.num_limited_groups,
+                top_k=spec.top_k,
+                score_func=spec.score_func,
+                route_norm=route_norm,
+                route_scale=spec.route_scale,
+                gate_bias=spec.gate_bias,
+                group_score_func=spec.group_score_func,
+            )
+            # Copy gate weights
+            _copy_parameter_data(self.router.gate.weight, source_gate.weight)
+            self.router.gate.weight.requires_grad_(source_gate.weight.requires_grad)
+            if spec.gate_bias and source_gate_bias is not None:
+                _copy_parameter_data(self.router.gate.bias, source_gate_bias)
+                self.router.gate.bias.requires_grad_(source_gate_bias.requires_grad)
 
-        # Copy pre-trained score correction bias (DeepSeek-V3/Moonlight noaux_tc routing)
-        source_ecb = getattr(source_gate, 'e_score_correction_bias', None)
-        if source_ecb is not None and isinstance(source_ecb, nn.Parameter):
-            self.router.e_score_correction_bias = nn.Parameter(source_ecb.data.clone(),
-                                                               requires_grad=source_ecb.requires_grad)
-            logger.info('AutoEP: copied e_score_correction_bias from source gate '
-                        '(shape=%s)', source_ecb.shape)
+            # Copy pre-trained score correction bias (DeepSeek-V3/Moonlight noaux_tc routing)
+            if source_ecb is not None:
+                _copy_e_score_correction_bias(self.router, source_ecb_owner, source_ecb, source_ecb_path)
 
         # Alias router under the name OutputRecorder expects (layer_name if provided),
         # but only when OutputRecorder captures from the router child and the alias is safe.
@@ -438,6 +499,7 @@ class AutoEPMoELayer(nn.Module):
             hidden_dim=spec.ffn_hidden_size,
             num_experts=self.num_local_experts,
             use_grouped_mm=config.use_grouped_mm,
+            disable_triton_grouped_mm=config.disable_triton_grouped_mm,
         )
         _copy_parameter_data(self.experts.w1, w1)
         _copy_parameter_data(self.experts.w2, w2)
@@ -446,7 +508,6 @@ class AutoEPMoELayer(nn.Module):
         self.experts.w2.requires_grad_(w2_requires_grad)
         self.experts.w3.requires_grad_(w3_requires_grad)
 
-        self.reorderer = TokenReorderer(num_experts=self.num_experts, top_k=self.top_k)
         self.shared_experts = getattr(source_module, spec.shared_experts_name,
                                       None) if spec.has_shared_experts else None
         self.shared_experts_gate = getattr(source_module, spec.shared_experts_gate_name,
@@ -456,16 +517,26 @@ class AutoEPMoELayer(nn.Module):
         for param in self.experts.parameters():
             param.allreduce = False
             param.group_name = self.ep_group_name
+            param.ds_zero_placement_family = "autoep_expert"
+            param.ds_zero_partition_group_name = self.ep_group_name
 
-        # Mark shared expert and router params for global DP reduction
+        # Mark shared expert and router params for global DP reduction.
+        # The router runs redundantly on every TP peer and its gradient is
+        # rebuilt into a replicated full view by the restore all-gather, so it
+        # is tagged as the replicated family (AVERAGE TP reduction); a SUM would
+        # double it under tp_size=2. See mark_autoep_folding_router_parameter.
         for param in self.router.parameters():
             param.allreduce = True
+            mark_autoep_folding_router_parameter(param)
+            param.ds_zero_placement_family = "replicated"
         if self.shared_experts is not None:
             for param in self.shared_experts.parameters():
                 param.allreduce = True
+                param.ds_zero_placement_family = "replicated"
         if self.shared_experts_gate is not None:
             for param in self.shared_experts_gate.parameters():
                 param.allreduce = True
+                param.ds_zero_placement_family = "replicated"
 
         # Load balancing buffers
         self.load_balance_coeff = resolved_config.load_balance_coeff
@@ -486,6 +557,13 @@ class AutoEPMoELayer(nn.Module):
 
         # Router-logit cache
         self._cached_router_logits = None
+        # Resolved once per layer: a DeepEP exchange sizes its buffer at
+        # construction, so it is built on first use and kept.
+        self.comm_backend = config.comm_backend
+        self.comm_num_sm = config.comm_num_sm
+        self.comm_qp_margin = config.comm_qp_margin
+        self._deepep_exchange = None
+        self.comm_max_tokens_per_rank = config.comm_max_tokens_per_rank
         self._register_logit_hook()
 
     def _register_logit_hook(self):
@@ -508,10 +586,31 @@ class AutoEPMoELayer(nn.Module):
     def set_deepspeed_parallelism(
         self,
         use_data_before_expert_parallel_: bool = False,
+        folding_group_handles=None,
     ) -> None:
         """Bind EP group handle to this module."""
         from deepspeed.utils import groups
         from deepspeed.utils.bwc import bwc_pipeline_parallel_world_size
+
+        if folding_group_handles is not None:
+            self.folding_group_handles = folding_group_handles
+            if self.combine_impl == "fused_weighted_sum" and folding_group_handles.spec.tp_size > 1:
+                # Folded TP restores tokens through a different path.
+                raise ValueError('combine_impl="fused_weighted_sum" does not support folded tensor parallelism '
+                                 f"(tensor_parallel.autotp_size={folding_group_handles.spec.tp_size}). Set "
+                                 'tensor_parallel.autotp_size to 1, or leave combine_impl unset.')
+            if self.comm_backend == DEEPEP_BACKEND and folding_group_handles.spec.tp_size > 1:
+                # DeepEP's combine returns token-major rows, which folded TP's
+                # assignment-metadata restore can't consume. Refuse rather than
+                # silently fall back to a backend the job didn't ask for.
+                raise ValueError(f'comm_backend="{DEEPEP_BACKEND}" does not support folded tensor parallelism '
+                                 f"(expert_tensor_parallel_size={folding_group_handles.spec.tp_size}). Set "
+                                 'expert_tensor_parallel_size to 1, or comm_backend to "comm".')
+            self.ep_group_name = folding_group_handles.ep_group_name
+            self.ep_group = folding_group_handles.ep_group
+            self.tp_group = folding_group_handles.tp_group
+            self.ep_rank = dist.get_rank(group=self.ep_group)
+            return
 
         if self.ep_group_name not in groups._get_expert_parallel_group_dict():
             mp_size = max(
@@ -529,78 +628,81 @@ class AutoEPMoELayer(nn.Module):
             )
         self.ep_group = groups._get_expert_parallel_group(self.ep_group_name)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass.
+    def _deepep_route(self, tokens: torch.Tensor, ro: "RouterOutput") -> torch.Tensor:
+        """Dispatch, run the experts, and combine through DeepEP.
 
-        Args:
-            hidden_states: [B, S, H]
-
-        Returns:
-            [B, S, H] or ([B, S, H], [T, E]) if return_router_logits.
-            Some HF MoE contracts return ([T, H], [T, E]) instead.
+        ``tokens`` is [T, H] before top-k expansion. DeepEP replicates each
+        token to the ranks that need it rather than being handed one row per
+        selected expert, groups arrivals by expert for the grouped GEMM, and
+        sums them back. It therefore replaces the expansion and the reduction
+        around the collectives, not just the collectives, and returns [T, H]
+        ready for the shared tail of forward.
         """
-        bsz, seqlen, hdim = hidden_states.shape
-        x = hidden_states.reshape(-1, hdim)  # [T, H]
+        assert_dtype_supported(tokens.dtype)
 
-        # Router
-        ro: RouterOutput = RouterOutput(*self.router(x, self.expert_bias))
-
-        # Accumulate expert utilization
-        with torch.no_grad():
-            self.tokens_per_expert.add_(ro.num_tokens_per_expert)
-
-        # Reorder tokens by expert
-        top_scores_sorted, token_indices_sorted, _ = self.reorderer(ro.top_scores, ro.selected_experts)
-
-        routed_input = x[token_indices_sorted // self.top_k]  # [N, H]
-        routed_input = apply_scores_before_experts_if_enabled(routed_input,
-                                                              top_scores_sorted,
-                                                              score_apply=self.score_apply)
-
-        if self.ep_size == 1:
-            # No AllToAll needed - local computation only
-            local_counts = count_tokens_per_expert(
-                ro.selected_experts,
-                self.num_local_experts,
-                out_dtype=torch.int32,
-            )
-
-            routed_input_permuted, perm_indices, aligned_counts, n_tokens = permute_by_local_expert(
-                routed_input, local_counts)
-            expert_output = self.experts(routed_input_permuted, aligned_counts)
-            expert_output = unpermute_by_local_expert(expert_output, perm_indices, n_tokens)
-        else:
-            # EP dispatch/compute/combine
-            plan = compute_split_plan(
-                selected_experts=ro.selected_experts,
-                num_experts=self.num_experts,
-                ep_size=self.ep_size,
-                num_local_experts=self.num_local_experts,
+        # The configured worst-case capacity is identical across ranks, so
+        # buffer construction needs no rank-local resize decision.
+        if self._deepep_exchange is None:
+            # An externally initialized process group may still have a lazy
+            # NCCL communicator. DeepEP needs it before constructing its team;
+            # the removed split-count collective used to initialize it for us.
+            dist.barrier(group=self.ep_group, device_ids=[tokens.device.index])
+            self._deepep_exchange = DeepEPExchange(
                 ep_group=self.ep_group,
+                num_experts=self.num_experts,
+                top_k=self.top_k,
+                hidden_size=self.hidden_size,
+                num_max_tokens_per_rank=self.comm_max_tokens_per_rank,
+                num_sms=self.comm_num_sm,
+                qp_margin=self.comm_qp_margin,
             )
 
-            routed_input = _AllToAllV.apply(self.ep_group, routed_input, plan.input_splits, plan.output_splits)
+        if tokens.shape[0] > self._deepep_exchange.num_max_tokens_per_rank:
+            raise RuntimeError(
+                f"this rank routed {tokens.shape[0]} tokens, more than the "
+                f"{self._deepep_exchange.num_max_tokens_per_rank} configured for the DeepEP buffer. Set "
+                "comm_max_tokens_per_rank in the expert_parallel config to the largest per-rank token count this "
+                "job will produce, normally train_micro_batch_size_per_gpu * maximum padded sequence length, or "
+                'set comm_backend="comm".')
 
-            routed_input, perm_indices, aligned_counts, n_tokens = permute_by_local_expert(
-                routed_input, plan.local_counts_by_source)
-            expert_output = self.experts(routed_input, aligned_counts)
-            expert_output = unpermute_by_local_expert(expert_output, perm_indices, n_tokens)
+        received, recv_weights, exchange = deepep_dispatch(self._deepep_exchange, tokens, ro.selected_experts,
+                                                           ro.top_scores)
+        handle = exchange.last_handle
 
-            expert_output = _AllToAllV.apply(self.ep_group, expert_output, plan.output_splits, plan.input_splits)
+        # combine reads exactly the rows the handle says arrived, taken from
+        # the handle as a Python int rather than off the device prefix sum to
+        # avoid a device-to-host sync in front of every layer's expert GEMM.
+        arrived = handle.num_expanded_tokens
+        received = received[:arrived]
 
-        output = combine_from_routed(
-            expert_output,
-            top_scores=ro.top_scores,
-            token_indices_sorted=token_indices_sorted,
-            top_k=self.top_k,
-            score_apply=self.score_apply,
-            combine_impl=self.combine_impl,
-            shape=(bsz, seqlen, hdim),
-        )
+        # Applied here, not handed to combine: DeepEP's combine transports and
+        # reduces topk_weights but doesn't multiply rows by them. Which side of
+        # the experts it lands on must match the collective path, since SwiGLU
+        # doesn't commute with the weight.
+        weights = None if recv_weights is None else recv_weights[:arrived].reshape(-1, 1)
+        if weights is not None and self.score_apply == "pre":
+            received = (received.float() * weights).to(received.dtype)
+            weights = None
 
+        # The grouped GEMM needs per-expert row counts, which arrive as a
+        # prefix sum over the experts this rank owns. Differencing it recovers
+        # the counts.
+        prefix = handle.psum_num_recv_tokens_per_expert
+        counts = torch.diff(prefix, prepend=prefix.new_zeros(1)).to(torch.int32)
+        if counts.numel() != self.num_local_experts:
+            raise RuntimeError(f"DeepEP returned {counts.numel()} expert counts, but this rank owns "
+                               f"{self.num_local_experts} experts")
+
+        expert_output = self.experts(received, counts)
+
+        if weights is not None:
+            expert_output = (expert_output.float() * weights).to(expert_output.dtype)
+
+        return deepep_combine(exchange, expert_output, handle)
+
+    def _finalize_output(self, output: torch.Tensor, x: torch.Tensor, hidden_states: torch.Tensor,
+                         hdim: int) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Apply the model-specific output tail shared by every communication backend."""
         if self.moe_output_shape == "flat":
             output = output.reshape(-1, hdim)
             shared_expert_input = x
@@ -625,3 +727,226 @@ class AutoEPMoELayer(nn.Module):
 
         self._cached_router_logits = None
         return output
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass.
+
+        Args:
+            hidden_states: [B, S, H]
+
+        Returns:
+            [B, S, H] or ([B, S, H], [T, E]) if return_router_logits.
+            Some HF MoE contracts return ([T, H], [T, E]) instead.
+        """
+        bsz, seqlen, hdim = hidden_states.shape
+        x = hidden_states.reshape(-1, hdim)  # [T, H]
+
+        # Fail all ranks before any collective can stall.
+        if self.combine_impl == "fused_weighted_sum" and not self._fused_combine_checked:
+            fused_token_ops.assert_supported(x, score_apply=self.score_apply)
+            self._fused_combine_checked = True
+
+        # Router
+        ro: RouterOutput = RouterOutput(*self.router(x, self.expert_bias))
+
+        # Accumulate expert utilization
+        with torch.no_grad():
+            self.tokens_per_expert.add_(ro.num_tokens_per_expert)
+
+        if self.ep_size > 1 and self.comm_backend == DEEPEP_BACKEND:
+            output = self._deepep_route(x, ro).reshape(bsz, seqlen, hdim)
+            return self._finalize_output(output, x, hidden_states, hdim)
+
+        # Reorder tokens into expert-contiguous order.
+        token_indices_sorted = torch.argsort(ro.selected_experts.view(-1), stable=True)
+        top_scores_sorted = ro.top_scores.view(-1)[token_indices_sorted]
+        expert_indices_sorted = ro.selected_experts.reshape(-1).index_select(0, token_indices_sorted)
+
+        folded_tp = self.folding_group_handles is not None and self.folding_group_handles.spec.tp_size > 1
+        restore_ctx = None
+        if folded_tp:
+            from deepspeed.moe.ep_tp_dispatch import (
+                RoutedAssignmentPayload,
+                assignment_ordinals_by_expert,
+                assert_tp_payload_consistent,
+                dispatch_counters,
+                partition_assignments,
+                restore_combined,
+            )
+            payload = RoutedAssignmentPayload(
+                token_indices=(token_indices_sorted // self.top_k).to(torch.long),
+                expert_indices=expert_indices_sorted.to(torch.long),
+                assignment_indices=assignment_ordinals_by_expert(expert_indices_sorted.to(torch.long)),
+                capacity_slots=(token_indices_sorted % self.top_k).to(torch.long),
+                combine_weights=top_scores_sorted
+                if self.score_apply == "post" else torch.ones_like(top_scores_sorted),
+                drop_mask=torch.zeros_like(top_scores_sorted, dtype=torch.bool),
+                pad_mask=torch.zeros_like(top_scores_sorted, dtype=torch.bool),
+                input_splits=[0 for _ in range(self.ep_size)],
+                output_splits=[0 for _ in range(self.ep_size)],
+                extra={
+                    "destination_ranks": (expert_indices_sorted // self.num_local_experts).to(torch.long),
+                    "top_scores": top_scores_sorted,
+                    "num_tokens": torch.tensor(bsz * seqlen, device=hidden_states.device, dtype=torch.long),
+                },
+            )
+            if self.validate_folding_routing:
+                assert_tp_payload_consistent(payload,
+                                             tp_group=self.tp_group,
+                                             tp_size=self.folding_group_handles.spec.tp_size)
+            tp_rank = dist.get_rank(group=self.tp_group)
+            local_payload, restore_ctx = partition_assignments(payload,
+                                                               tp_group=self.tp_group,
+                                                               tp_rank=tp_rank,
+                                                               tp_size=self.folding_group_handles.spec.tp_size)
+            token_indices_for_compute = token_indices_sorted.index_select(0, restore_ctx.local_indices)
+            top_scores_for_compute = top_scores_sorted.index_select(0, restore_ctx.local_indices)
+            expert_indices_for_plan = local_payload.expert_indices
+        else:
+            token_indices_for_compute = token_indices_sorted
+            top_scores_for_compute = top_scores_sorted
+            expert_indices_for_plan = expert_indices_sorted
+
+        routed_input = x[token_indices_for_compute // self.top_k]  # [N, H]
+        routed_input = apply_scores_before_experts_if_enabled(routed_input,
+                                                              top_scores_for_compute,
+                                                              score_apply=self.score_apply)
+
+        if self.ep_size == 1:
+            # No AllToAll needed - local computation only
+            local_counts = ro.num_tokens_per_expert
+
+            routed_input_permuted, perm_indices, aligned_counts, n_tokens = permute_by_local_expert(
+                routed_input, local_counts)
+            expert_output = self.experts(routed_input_permuted, aligned_counts)
+            expert_output = unpermute_by_local_expert(expert_output, perm_indices, n_tokens)
+        else:
+            # EP dispatch/compute/combine
+            if folded_tp:
+                plan = compute_split_plan_from_expert_indices(
+                    expert_indices=expert_indices_for_plan,
+                    num_experts=self.num_experts,
+                    ep_size=self.ep_size,
+                    num_local_experts=self.num_local_experts,
+                    ep_group=self.ep_group,
+                )
+            else:
+                plan = compute_split_plan(
+                    selected_experts=ro.selected_experts,
+                    num_experts=self.num_experts,
+                    ep_size=self.ep_size,
+                    num_local_experts=self.num_local_experts,
+                    ep_group=self.ep_group,
+                    num_tokens_per_expert=ro.num_tokens_per_expert,
+                )
+
+            routed_input = _AllToAllV.apply(self.ep_group, routed_input, plan.input_splits, plan.output_splits)
+
+            routed_input, perm_indices, aligned_counts, n_tokens = permute_by_local_expert(
+                routed_input, plan.local_counts_by_source)
+            expert_output = self.experts(routed_input, aligned_counts)
+            expert_output = unpermute_by_local_expert(expert_output, perm_indices, n_tokens)
+
+            expert_output = _AllToAllV.apply(self.ep_group, expert_output, plan.output_splits, plan.input_splits)
+
+        if folded_tp:
+            output = restore_combined(expert_output,
+                                      restore_ctx,
+                                      tp_group=self.tp_group,
+                                      validate_coverage=self.validate_folding_routing).reshape(bsz, seqlen, hdim)
+            self._last_folding_dispatch_counters = dispatch_counters(restore_ctx)
+        elif self.combine_impl == "fused_weighted_sum":
+            output = fused_token_ops.fused_weighted_restore(
+                expert_output,
+                top_scores=ro.top_scores,
+                token_indices_sorted=token_indices_sorted,
+                top_k=self.top_k,
+                shape=(bsz, seqlen, hdim),
+            )
+        else:
+            output = combine_from_routed(
+                expert_output,
+                top_scores=ro.top_scores,
+                token_indices_sorted=token_indices_sorted,
+                top_k=self.top_k,
+                score_apply=self.score_apply,
+                combine_impl=self.combine_impl,
+                shape=(bsz, seqlen, hdim),
+            )
+
+        return self._finalize_output(output, x, hidden_states, hdim)
+
+
+class ReplacementSourceMap:
+    """What a module replacement did, in the terms the client-optimizer remap needs.
+
+    ``sources`` maps each replacement parameter to the source parameters it was built from, keyed
+    by ``id()``, so a replacement can rejoin the param group its sources were in.
+
+    ``discarded`` holds the ``id()`` of every parameter the replacement detached from the module
+    tree, including the experts belonging to other ranks, which ``sources`` never names. It is what
+    lets the remap remove exactly the parameters the replacement invalidated instead of everything
+    it cannot find in the model, which would also remove a caller's unrelated external parameters.
+
+    Storing identities rather than the parameters themselves is safe here: any discarded parameter
+    the optimizer still holds is kept alive by that optimizer, so its identity cannot be reused
+    while the remap is looking at it.
+    """
+
+    def __init__(self):
+        self.sources: dict[int, list[nn.Parameter]] = {}
+        self.discarded: set[int] = set()
+
+    def update(self, other: "ReplacementSourceMap") -> None:
+        self.sources.update(other.sources)
+        self.discarded.update(other.discarded)
+
+    def __bool__(self) -> bool:
+        return bool(self.sources)
+
+
+def collect_replacement_sources(source_module, replacement, spec, ep_size, ep_rank):
+    """Return the ``ReplacementSourceMap`` describing what this replacement did.
+
+    A caller-supplied optimizer has already sorted the sources into param groups, so this is what
+    lets the engine put each replacement back into the group its sources came from, and remove
+    exactly the parameters the replacement invalidated.
+
+    Built by the caller rather than stashed on the layer: the values are the discarded pre-shard
+    expert weights, and an attribute on a long-lived module would keep them alive for the whole
+    run, defeating the sharding AutoEP exists to do.
+    """
+    source_gate = getattr(source_module, spec.router_name)
+    w1_sources, w2_sources, w3_sources = repack_expert_source_params(
+        experts_source=getattr(source_module, spec.experts_name),
+        spec=spec,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+    )
+    collected = ReplacementSourceMap()
+    # Every parameter the source module owned is about to leave the tree. The ones the replacement
+    # keeps (shared experts) are still reachable from the model, and the remap filters on that.
+    collected.discarded = {id(param) for param in source_module.parameters()}
+    sources = collected.sources
+    sources.update({
+        id(replacement.experts.w1): list(w1_sources),
+        id(replacement.experts.w2): list(w2_sources),
+        id(replacement.experts.w3): list(w3_sources),
+        id(replacement.router.gate.weight): [source_gate.weight],
+    })
+    source_gate_bias = getattr(source_gate, 'bias', None)
+    if spec.gate_bias and source_gate_bias is not None:
+        sources[id(replacement.router.gate.bias)] = [source_gate_bias]
+    source_ecb = getattr(source_gate, 'e_score_correction_bias', None)
+    if isinstance(source_ecb, nn.Parameter):
+        sources[id(replacement.router.e_score_correction_bias)] = [source_ecb]
+    # Anything else the router or the grouped experts allocated has no counterpart in the source
+    # module, so tie it to this block's gate weight: it carries no pretrained value of its own,
+    # but it still belongs with the rest of this block's parameters.
+    for fresh_module in (replacement.router, replacement.experts):
+        for param in fresh_module.parameters():
+            sources.setdefault(id(param), [source_gate.weight])
+    return collected

@@ -5,10 +5,21 @@
 
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 
+import os
+
+# By default, PyTorch's CUDA availability check (cudaGetDeviceCount/cuInit)
+# creates a CUDA context, which poisons fork()-based multiprocessing once
+# DeepSpeed probes op compatibility at import time. Opt into PyTorch's
+# NVML-based availability check so importing DeepSpeed never creates a CUDA
+# context, before importing torch or anything that may query CUDA.
+# setdefault() preserves an explicit user setting. See issue #7918.
+os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
+
+import argparse
 import sys
 import types
 import json
-from typing import Optional, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 import torch
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
@@ -31,6 +42,8 @@ from .accelerator import get_accelerator
 from .constants import TORCH_DISTRIBUTED_DEFAULT_PORT
 from .runtime.engine import DeepSpeedEngine, DeepSpeedOptimizerCallable, DeepSpeedSchedulerCallable
 from .runtime.engine import ADAM_OPTIMIZER, LAMB_OPTIMIZER, MUON_OPTIMIZER
+from .runtime.base_optimizer import DeepSpeedOptimizer
+from .runtime.dataloader import DeepSpeedDataLoader
 from .runtime.hybrid_engine import DeepSpeedHybridEngine
 from .runtime.pipe.engine import PipelineEngine
 from .inference.engine import InferenceEngine
@@ -70,28 +83,45 @@ __git_branch__ = git_branch
 dist = None
 
 
-def set_optimizer_flags(config_class, model):
+def _layer_shape(param: torch.Tensor):
+    """The parameter's shape as a layer, rather than as a ZeRO-3 partition.
+
+    Under ``deepspeed.zero.Init`` a partitioned parameter's data is a flat placeholder -
+    ``torch.Size([0])`` on the ranks that do not hold it - and the shape it has as a layer is
+    recorded as ``ds_shape``. Reading ``param.shape`` there sees a 1-D tensor for every
+    parameter in the model.
+    """
+    ds_shape = getattr(param, "ds_shape", None)
+    return tuple(param.shape) if ds_shape is None else tuple(ds_shape)
+
+
+def set_optimizer_flags(config_class: DeepSpeedConfig, model: torch.nn.Module) -> None:
     if config_class.optimizer_name == MUON_OPTIMIZER:
         for name, p in model.named_parameters():
-            if p.ndim >= 2 and not any(keyword in name.lower() for keyword in ("embed", "lm_head")):
+            # Muon is defined on matrices, so the test is on the layer's shape. `zero.Init`
+            # makes every parameter report as 1-D, which would switch Muon off for the whole
+            # model without anything saying so.
+            if len(_layer_shape(p)) >= 2 and not any(keyword in name.lower() for keyword in ("embed", "lm_head")):
                 setattr(p, "use_muon", True)
             else:
                 setattr(p, "use_muon", False)
 
 
-def initialize(args=None,
-               model: torch.nn.Module = None,
-               optimizer: Optional[Union[Optimizer, DeepSpeedOptimizerCallable]] = None,
-               model_parameters: Optional[torch.nn.Module] = None,
-               training_data: Optional[torch.utils.data.Dataset] = None,
-               lr_scheduler: Optional[Union[_LRScheduler, DeepSpeedSchedulerCallable]] = None,
-               distributed_port: int = TORCH_DISTRIBUTED_DEFAULT_PORT,
-               mpu=None,
-               dist_init_required: Optional[bool] = None,
-               collate_fn=None,
-               config=None,
-               mesh_param=None,
-               config_params=None):
+def initialize(
+    args: Any = None,
+    model: torch.nn.Module = None,
+    optimizer: Optional[Union[Optimizer, DeepSpeedOptimizerCallable]] = None,
+    model_parameters: Optional[torch.nn.Module] = None,
+    training_data: Optional[torch.utils.data.Dataset] = None,
+    lr_scheduler: Optional[Union[_LRScheduler, DeepSpeedSchedulerCallable]] = None,
+    distributed_port: int = TORCH_DISTRIBUTED_DEFAULT_PORT,
+    mpu: Any = None,
+    dist_init_required: Optional[bool] = None,
+    collate_fn: Optional[Callable] = None,
+    config: Optional[Union[str, Dict[str, Any]]] = None,
+    mesh_param: Any = None,
+    config_params: Optional[Union[str, Dict[str, Any]]] = None
+) -> Tuple[DeepSpeedEngine, Optional[Union[Optimizer, DeepSpeedOptimizer]], Optional[DeepSpeedDataLoader], Any]:
     """Initialize the DeepSpeed Engine.
 
     Arguments:
@@ -289,7 +319,7 @@ def _add_core_arguments(parser):
     return parser
 
 
-def add_config_arguments(parser):
+def add_config_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     r"""Update the argument parser to enabling parsing of DeepSpeed command line arguments.
         The set of DeepSpeed arguments include the following:
         1) --deepspeed: boolean flag to enable DeepSpeed
@@ -305,14 +335,16 @@ def add_config_arguments(parser):
     return parser
 
 
-def default_inference_config():
+def default_inference_config() -> Dict[str, Any]:
     """
         Return a default DeepSpeed inference configuration dictionary.
     """
     return DeepSpeedInferenceConfig().dict()
 
 
-def init_inference(model, config=None, **kwargs):
+def init_inference(model: torch.nn.Module,
+                   config: Optional[Union[str, Dict[str, Any]]] = None,
+                   **kwargs: Any) -> InferenceEngine:
     """Initialize the DeepSpeed InferenceEngine.
 
     Description: all four cases are valid and supported in DS init_inference() API.
@@ -390,7 +422,11 @@ def init_inference(model, config=None, **kwargs):
     return engine
 
 
-def tp_model_init(model, tp_size, dtype, config=None, **kwargs):
+def tp_model_init(model: torch.nn.Module,
+                  tp_size: int,
+                  dtype: torch.dtype,
+                  config: Optional[Union[str, Dict[str, Any]]] = None,
+                  **kwargs: Any) -> torch.nn.Module:
     """
     Record tensor-parallel initialization arguments for training.
 

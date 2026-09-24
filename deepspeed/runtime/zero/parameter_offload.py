@@ -15,6 +15,7 @@ from deepspeed.runtime.zero.partition_parameters import *
 from deepspeed.runtime.zero.partitioned_param_coordinator import PartitionedParameterCoordinator, InflightParamRegistry, iter_params
 from deepspeed.accelerator import get_accelerator
 from deepspeed import utils
+from deepspeed.utils.pin_memory_tracker import pinned_memory_summary
 
 FWD_MODULE_STACK = list()
 
@@ -61,11 +62,34 @@ class ZeROOrderedDict(OrderedDict):
         if param is None:
             return param
 
-        # TODO: only weaken this check during compilation
+        # Dynamo traces this getter while lifting module parameters. The
+        # physical ZeRO status is intentionally volatile across compiled
+        # forwards and must not become a cache guard.
+        if torch.compiler.is_compiling():
+            return param
+
+        is_eager_forward = self._parent_module._parameters._in_forward
+        fallback = None
+        if hasattr(param, "ds_status") and is_eager_forward:
+            from deepspeed.compile.z3_eager_fallback import get_active_z3_eager_fallback, is_dynamo_guard_evaluation
+            fallback = get_active_z3_eager_fallback()
+            if (fallback is not None and param.ds_status == ZeroParamStatus.AVAILABLE
+                    and not is_dynamo_guard_evaluation()):
+                fallback.record_param_access(param)
+
         if hasattr(param, "ds_status") and param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
-            if self._parent_module._parameters._in_forward:
-                register_external_parameter(FWD_MODULE_STACK[-1], param)
-                param.all_gather()
+            if is_eager_forward:
+                if fallback is not None and is_dynamo_guard_evaluation():
+                    # A guard only inspects parameter identity/metadata. Gathering here
+                    # would retain a full parameter before the compiled forward begins.
+                    fallback.record_guard_suppressed_param(param)
+                    return param
+                if fallback is None:
+                    register_external_parameter(FWD_MODULE_STACK[-1], param)
+                    param.all_gather()
+                else:
+                    param.all_gather()
+                    fallback.record_gathered_param(param)
                 print_rank_0(f'Registering external parameter from getter {key} ds_id = {param.ds_id}', force=False)
 
         return param
@@ -208,6 +232,7 @@ class DeepSpeedZeRoOffload(object):
             force=False)
 
         see_memory_usage("DeepSpeedZeRoOffload initialize [end]", force=False)
+        pinned_memory_summary("ZeRO-3 parameter offload init")
 
     @instrument_w_nvtx
     def partition_all_parameters(self):
@@ -218,6 +243,11 @@ class DeepSpeedZeRoOffload(object):
         for param in iter_params(self.module, recurse=True):
             if param.ds_status != ZeroParamStatus.NOT_AVAILABLE:
                 raise RuntimeError(f"{param.ds_summary()} expected to be released")
+
+    def release_backward_leftovers(self):
+        """Release params of submodules whose post-backward hook never fired (e.g. modules
+        fed a no-grad input). Cheap no-op when the backward stack is already empty."""
+        self.get_param_coordinator().release_backward_leftovers()
 
     def get_param_coordinator(self):
         return self.param_coordinator
@@ -313,6 +343,7 @@ class DeepSpeedZeRoOffload(object):
                 coordinator._invalidate_trace()
         my_count = count[0]
         module.ds_id = my_count
+        module.ds_recompute_parameters = set()
 
         #print(f"{module.__class__} : {module.ds_id}")
 
@@ -417,7 +448,9 @@ class DeepSpeedZeRoOffload(object):
         self.forward_hooks.append(module.register_forward_hook(_post_forward_module_hook))
 
         # Pre backward hook
-        if not hasattr(module, "pre_bwd_fn"):
+        # Attribute-delegating wrappers may expose a child's hook state, but these closures and counters are
+        # module-local.
+        if "pre_bwd_fn" not in module.__dict__:
 
             @instrument_w_nvtx
             def _run_before_backward_function(sub_module):
@@ -440,7 +473,7 @@ class DeepSpeedZeRoOffload(object):
                 def setup_context(ctx, inputs, output):
                     ctx.module = module
                     ctx.pre_backward_function = _run_before_backward_function
-                    if not hasattr(ctx.module, "applied_pre_backward_ref_cnt"):
+                    if "applied_pre_backward_ref_cnt" not in ctx.module.__dict__:
                         ctx.module.applied_pre_backward_ref_cnt = 0
                     ctx.module.applied_pre_backward_ref_cnt += 1
 
@@ -454,7 +487,7 @@ class DeepSpeedZeRoOffload(object):
         self.backward_hooks.append(module.register_forward_hook(_pre_backward_module_hook))
 
         # post backward hook
-        if not hasattr(module, "post_bwd_fn"):
+        if "post_bwd_fn" not in module.__dict__:
 
             @instrument_w_nvtx
             def _run_after_backward_function(sub_module):
@@ -496,7 +529,9 @@ class DeepSpeedZeRoOffload(object):
 
     @torch.no_grad()
     def pre_sub_module_forward_function(self, sub_module):
-        see_memory_usage(f"Before sub module function {sub_module.__class__.__name__}", force=False)
+        see_memory_usage(
+            f"Before sub module forward function {sub_module.__class__.__name__} {sub_module.ds_id=} before fetch",
+            force=False)
 
         global FWD_MODULE_STACK
         FWD_MODULE_STACK.append(sub_module)
@@ -512,12 +547,14 @@ class DeepSpeedZeRoOffload(object):
             for param in params_to_fetch:
                 param.data = param.data.t() if len(param.ds_shape) != 1 else param.data
 
-        see_memory_usage(f"Before sub module function {sub_module.__class__.__name__} after fetch", force=False)
+        see_memory_usage(
+            f"Before sub module forward function {sub_module.__class__.__name__} {sub_module.ds_id=} after fetch",
+            force=False)
 
     @torch.no_grad()
     def post_sub_module_forward_function(self, sub_module):
         see_memory_usage(
-            f"After sub module function {sub_module.__class__.__name__} {sub_module.ds_id} before release",
+            f"After sub module forward function {sub_module.__class__.__name__} {sub_module.ds_id=} before release",
             force=False)
 
         if self.zenflow:
@@ -529,12 +566,15 @@ class DeepSpeedZeRoOffload(object):
         param_coordinator.release_sub_module(sub_module, forward=True)
 
         see_memory_usage(
-            f"After sub module function {sub_module.__class__.__name__}  {sub_module.ds_id} after release",
+            f"After sub module forward function {sub_module.__class__.__name__}  {sub_module.ds_id} after release",
             force=False)
 
     @torch.no_grad()
     def pre_sub_module_backward_function(self, sub_module):
-        # assert sub_module.training, "backward pass is invalid for module in evaluation mode"
+        see_memory_usage(
+            f"Before sub module backward function {sub_module.__class__.__name__} {sub_module.ds_id=} before fetch",
+            force=False)
+
         param_coordinator = self.get_param_coordinator()
         param_coordinator.trace_prologue(sub_module)
         if param_coordinator.is_record_trace():
@@ -546,11 +586,15 @@ class DeepSpeedZeRoOffload(object):
             for param in params_to_fetch:
                 param.data = param.data.t() if len(param.ds_shape) != 1 else param.data
 
+        see_memory_usage(
+            f"Before sub module backward function {sub_module.__class__.__name__} {sub_module.ds_id=} after fetch",
+            force=False)
+
     @torch.no_grad()
     def post_sub_module_backward_function(self, sub_module):
         # assert sub_module.training, "backward pass is invalid for module in evaluation mode"
         see_memory_usage(
-            f"After sub module backward function {sub_module.__class__.__name__} {sub_module.ds_id} before release",
+            f"After sub module backward function {sub_module.__class__.__name__} {sub_module.ds_id=} before release",
             force=False)
 
         if self.zenflow:
@@ -561,7 +605,7 @@ class DeepSpeedZeRoOffload(object):
         self.get_param_coordinator().release_sub_module(sub_module, forward=False)
 
         see_memory_usage(
-            f"After sub module backward function {sub_module.__class__.__name__} {sub_module.ds_id} after release",
+            f"After sub module backward function {sub_module.__class__.__name__} {sub_module.ds_id=} after release",
             force=False)
 
     def _set_z3_leaf_modules_by_threshold(self, module, zero_module_granularity_threshold):

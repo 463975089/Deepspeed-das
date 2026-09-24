@@ -4,6 +4,8 @@
 # DeepSpeed Team
 
 import os
+import sys
+import subprocess
 import importlib.util
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -18,6 +20,9 @@ CUDAOpBuilder = builder_module.CUDAOpBuilder
 
 BUILDER_MODULE = builder_module
 CUDA_API = BUILDER_MODULE.torch.cuda  #ignore-cuda
+MissingCUDAException = builder_module.MissingCUDAException
+installed_cuda_version = builder_module.installed_cuda_version
+probe_is_compatible = builder_module.probe_is_compatible
 
 
 class _StubCUDAOpBuilder(CUDAOpBuilder):
@@ -216,3 +221,120 @@ def test_non_jit_branch_canonical_dedupe_mixed_ptx_combinations():
             args = builder.compute_capability_args()
             assert os.environ["TORCH_CUDA_ARCH_LIST"] == expected_arch_list, arch_input
         assert args == expected_args, arch_input
+
+
+def test_cuda_capability_major_skips_probe_when_context_not_initialized():
+    # Probing device properties forces a lazy CUDA-context init, which creates a
+    # CUDA context. Doing that while checking op compatibility at "import deepspeed"
+    # time poisons fork()-based multiprocessing (issue #7918): a forked child cannot
+    # reuse the parent's context. With no context yet, the probe must be skipped.
+    builder = make_builder()
+    with patch.object(CUDA_API, "is_initialized", return_value=False):
+        with patch.object(
+                CUDA_API, "get_device_properties",
+                side_effect=AssertionError("must not initialize CUDA / poison fork")) as get_device_properties:
+            assert builder.cuda_capability_major() is None
+    get_device_properties.assert_not_called()
+
+
+def test_cuda_capability_major_probes_when_context_already_initialized():
+    # When a CUDA context already exists (e.g. at op load time), probing is safe
+    # and must report the real compute-capability major.
+    builder = make_builder()
+    device_properties = MagicMock(major=8)
+    with patch.object(CUDA_API, "is_initialized", return_value=True):
+        with patch.object(CUDA_API, "_is_in_bad_fork", return_value=False):
+            with patch.object(CUDA_API, "get_device_properties",
+                              return_value=device_properties) as get_device_properties:
+                assert builder.cuda_capability_major() == 8
+    get_device_properties.assert_called_once_with(0)
+
+
+def test_cuda_capability_major_skips_probe_in_bad_fork():
+    # Inside a forked child that inherited an initialized-but-invalid context,
+    # probing would raise "Cannot re-initialize CUDA in forked subprocess", so it
+    # must be skipped there as well.
+    builder = make_builder()
+    with patch.object(CUDA_API, "is_initialized", return_value=True):
+        with patch.object(CUDA_API, "_is_in_bad_fork", return_value=True):
+            with patch.object(CUDA_API,
+                              "get_device_properties",
+                              side_effect=AssertionError("must not probe in a forked child")) as get_device_properties:
+                assert builder.cuda_capability_major() is None
+    get_device_properties.assert_not_called()
+
+
+def test_forked_child_can_use_cuda_after_importing_deepspeed():
+    # Core contract of issue #7918: after the parent process runs
+    # ``import deepspeed``, a forked child must still be able to initialize and
+    # use CUDA. If import created a CUDA context in the parent, the child fails
+    # with "Cannot re-initialize CUDA in forked subprocess". Everything runs in a
+    # dedicated subprocess so a poisoned parent cannot leak into the pytest worker
+    # or other tests.
+    program = "\n".join([
+        "import os, sys",
+        "import torch",
+        "import deepspeed  # must not create a CUDA context in the parent",
+        # device_count() is NVML-based and never initializes a context, so it is
+        # a fork-safe way to check for a GPU before forking.
+        "if torch.cuda.device_count() == 0:",  #ignore-cuda
+        "    print('NO_CUDA'); sys.exit(0)",
+        "pid = os.fork()",
+        "if pid == 0:",
+        "    try:",
+        "        torch.ones(1, device='cuda')",
+        "        os._exit(0)",
+        "    except Exception as exc:",
+        "        sys.stderr.write(repr(exc))",
+        "        os._exit(1)",
+        "_, status = os.waitpid(pid, 0)",
+        "sys.exit(os.waitstatus_to_exitcode(status))",
+    ])
+    env = os.environ.copy()
+    repo_root = str(Path(__file__).resolve().parents[3])
+    env["PYTHONPATH"] = repo_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    result = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, env=env, timeout=300)
+    if result.returncode != 0 and ("No module named 'deepspeed'" in result.stderr
+                                   or "No module named 'torch'" in result.stderr):
+        pytest.skip("deepspeed/torch not importable in a subprocess in this environment")
+    if result.stdout.strip() == "NO_CUDA":
+        pytest.skip("no CUDA device available")
+    assert result.returncode == 0, ("forked child could not use CUDA after 'import deepspeed' "
+                                    "(a CUDA context was created during import, issue #7918):\n" + result.stderr)
+
+
+def test_installed_cuda_version_reports_a_runtime_only_cuda_home_as_missing(tmp_path):
+    # CUDA_HOME often points at a runtime only install (a pip torch wheel, a conda cudatoolkit) that has
+    # no nvcc under bin/. That has to surface as MissingCUDAException, because that is what the callers
+    # falling back to a CPU only build already catch. See #7452.
+    with patch("torch.utils.cpp_extension.CUDA_HOME", str(tmp_path)):
+        with pytest.raises(MissingCUDAException, match="unable to compile CUDA op"):
+            installed_cuda_version()
+
+
+class _RaisingBuilder:
+    name = "raising_stub"
+
+    def is_compatible(self, verbose=False):
+        raise MissingCUDAException("CUDA_HOME does not exist, unable to compile CUDA op(s)")
+
+
+class _AnsweringBuilder:
+
+    def __init__(self, answer):
+        self.name = "answering_stub"
+        self.answer = answer
+
+    def is_compatible(self, verbose=False):
+        return self.answer
+
+
+def test_probe_is_compatible_does_not_propagate_a_failed_probe():
+    # Every op is probed at "import deepspeed" time whether or not it will ever be built, so one op
+    # builder that cannot answer must not take the whole import down.
+    assert probe_is_compatible(_RaisingBuilder()) is False
+
+
+@pytest.mark.parametrize("answer", [True, False])
+def test_probe_is_compatible_passes_through_a_successful_probe(answer):
+    assert probe_is_compatible(_AnsweringBuilder(answer)) is answer

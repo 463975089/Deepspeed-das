@@ -191,6 +191,7 @@ public:
                 }
             }
             auto target_dtype = dtype ? dtype.value() : ds_tensor.scalar_type();
+            at::cuda::CUDAStreamGuard guard(ag_stream_);
             output_bufs[ds_id] =
                 torch::empty({padded_numel}, ds_tensor.options().dtype(target_dtype));
         }
@@ -344,7 +345,11 @@ public:
             offload_comp_done_events_[id] =
                 std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
 
-            const auto options = at::TensorOptions().pinned_memory(true).device(torch::kCPU);
+            // Pin by default so async D2H/H2D can use full PCIe bandwidth; controlled by
+            // compile.offload_activation_pin_memory.
+            const auto options = at::TensorOptions()
+                                     .pinned_memory(offload_activation_pin_memory)
+                                     .device(torch::kCPU);
             offload_buffers_[id] = at::empty_like(tensor, options);
         }
 

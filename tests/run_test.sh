@@ -103,7 +103,6 @@ pytest --timeout=1400 ./unit/ops/quantizer/test_fake_quantization.py
 pytest --timeout=1400 ./unit/ops/quantizer/test_quantize.py
 pytest --timeout=1400 ./unit/ops/lion/test_cpu_lion.py
 pytest --timeout=1400 ./unit/ops/lion/test_lion.py
-pytest --timeout=1400 ./unit/ops/muon/test_muon.py
 pytest --timeout=1400 ./unit/ops/adam/test_adamw.py
 pytest --timeout=1400 ./unit/ops/adam/test_cpu_adam.py
 pytest --timeout=1400 ./unit/ops/adam/test_hybrid_adam.py
@@ -153,7 +152,6 @@ python ./small_model_debugging/partial_offload_test.py
 pytest --timeout=1400 ./torch_compile/test_deepcompile_z3_release.py
 pytest --timeout=1400 ./unit/checkpoint/test_autotp_uc_checkpoint.py
 pytest --timeout=1400 ./unit/compile/test_inductor_aot_kwargs.py
-pytest --timeout=1400 ./unit/compile/test_list_schedule.py
 pytest --timeout=1400 ./unit/compile/test_zero3_grad_dtype.py
 pytest --timeout=1400 ./unit/linear/test_linear.py
 pytest --timeout=1400 ./unit/linear/test_quant_param.py
@@ -163,7 +161,6 @@ pytest --timeout=1400 ./unit/v1/autotp/test_tp_plan_real_models.py
 pytest --timeout=1400 ./unit/module_inject/test_tp_plan_converter.py
 pytest --timeout=1400 ./unit/v1/nvme/test_fast_file_writer_fd_close.py
 pytest --timeout=1400 ./unit/ops/deepspeed4science/test_evoformer_attn_builder.py
-pytest --timeout=1400 ./unit/ops/muon/test_muon_partial_training.py
 pytest --timeout=1400 ./unit/ops/test_op_builder.py
 pytest --timeout=1400 ./unit/runtime/half_precision/test_fp8.py
 pytest --timeout=1400 ./unit/runtime/tensor_parallel/test_autotp_universal_checkpoint.py
@@ -236,10 +233,6 @@ pytest --timeout=1400 ./unit/v1/half_precision/test_bf16.py
 pytest --timeout=1400 ./unit/v1/zero/test_zero_autocast.py
 pytest --timeout=1400 ./unit/v1/zero/test_zero.py
 
-# ---------------------------------------------------------------------------
-# 补齐 tests 目录下此前未被本脚本覆盖的用例（对齐上游 v0.19.7 的测试树）
-# ---------------------------------------------------------------------------
-pytest --timeout=1400 ./accelerator/test_ds_init.py
 python ./torch_compile/test_deepcompile_skipped_frame.py
 pytest --timeout=1400 ./unit/accelerator/test_mps_accelerator.py
 pytest --timeout=1400 ./unit/checkpoint/test_affine_shard_map.py

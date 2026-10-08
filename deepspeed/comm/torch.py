@@ -273,16 +273,13 @@ class TorchBackend(Backend):
             # 4. binding a device also makes torch build every later new_group() with ncclCommSplit;
             #    a single-rank job has no peer to reach, so skip it there (#8248). Only skip when the
             #    world size is actually known, never on an assumed one.
-            # Disabled on DCU: binding device_id hangs here. Kept (with upstream's conditions
-            # folded in) so it can be re-enabled once DCU supports it.
-            """
             if (known_world_size(world_size) != 1
                     and 'device_id' in inspect.signature(torch.distributed.init_process_group).parameters
                     and not (version.parse("2.6.0") < version.parse(torch.__version__) < version.parse("2.7.1"))
-                    and get_accelerator().device_name() == 'cuda'):
+                    and get_accelerator().device_name() == 'cuda'
+                    and str(backend).lower() == 'nccl'):
                 local_rank = int(os.environ.get('LOCAL_RANK', 0))
                 kwargs.update(device_id=get_accelerator().device(local_rank))
-            """
             torch.distributed.init_process_group(backend, **kwargs)
 
         self.using_mpi = torch.distributed.get_backend() == 'mpi'

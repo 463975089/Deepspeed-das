@@ -471,7 +471,8 @@ def test_sub_param_layer_materializes_zero_width_final_dimension(layer_cls):
     layer._tp_partition([layer.weight, None])
 
     assert layer.weight.shape == (4, 0)
-    output = layer(torch.empty(2, 0))
+    # _tp_partition() moves the shards to the accelerator, so the input has to follow it.
+    output = layer(torch.empty(2, 0, device=layer.weight.device))
     assert output.shape == (2, 4)
 
 

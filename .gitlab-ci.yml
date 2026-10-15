@@ -1,0 +1,173 @@
+stages:
+  - quality-gate
+  - build
+  - publish
+
+variables:
+  FILE_SERVER_IP: "10.16.1.27"
+  FILE_SERVER_USER: "fileowner"
+  PIP_INDEX_URL: "http://10.16.1.201:9929/nightly/dtk2610/+simple/"
+  PIP_TRUSTED_HOST: "10.16.1.201"
+  DTK_PKG:
+    value: "/ArchivedFile/dtk-pkg/dtk26.10/DTK-26.10-Rocky8.6-x86_64.tar.gz"
+    description: "DTK 安装包路径，手动运行流水线时可修改"
+  DEVPI_URL: "http://10.16.1.201:9929/"
+  TORCH_VERSION:
+    value: "2.10.0"
+    description: "torch 版本，手动运行流水线时可修改 (publish 的 matrix 会覆盖此值)"
+  NUMPY_VERSION: "1.24.3"
+  # 测试日志 / JUnit 报告统一目录。test.sh 里默认 fallback 也指向这里。
+  REPORTS_DIR: "${CI_PROJECT_DIR}/reports"
+
+quality-gate:
+  stage: quality-gate
+  allow_failure: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^ds-v0.19.7-dev/'
+  tags:
+    - nmz
+  script:
+    - pip install hygon_quality_gate[scanners]
+    - python -m hygon_pr_gate.install_tools
+    # 拉取目标分支，供 --base 对比
+    - git fetch origin $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+    - quality-pr-scan --base origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME} --head ${CI_COMMIT_SHA}
+
+
+build:compile-and-test:
+  stage: build
+  timeout: 24h
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^ds-v0.19.7-dev$/'
+    # 手动触发 (Build > Pipelines > Run pipeline)，可在页面上覆盖 DTK_PKG
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  tags:
+    - nmz
+  before_script:
+    # 安装 DTK
+    - cp -f ${DTK_PKG} /opt/
+    - cd /opt && tar -xzf $(basename ${DTK_PKG}) && mv dtk-* dtk
+    - source /opt/dtk/env.sh && cd ${CI_PROJECT_DIR}
+    # 安装 AICC
+    - src_dir="/ArchivedFile/ai_cc/nightly"
+    - latest_run=$(cd "$src_dir" && ls dtk_llvm_*.run 2>/dev/null | sed 's/\.run$//' | sort -t '_' -k4 -nr | head -n1)
+    - 'echo "完整安装包路径: ${src_dir}/${latest_run}.run"'
+    - test -n "${latest_run}" && cp "${src_dir}/${latest_run}.run" ./ && chmod +x "${latest_run}.run" && yes | bash "${latest_run}.run" && echo "AICC 安装完成" || echo "跳过 AICC 安装"
+    # git 免密配置 (GIT_ASKPASS 方式，不修改 remote URL)
+    - |
+      cat > /tmp/git-askpass.sh << 'SCRIPT'
+      #!/bin/sh
+      case "$1" in
+        *Username*) echo "gitlab-ci-token" ;;
+        *Password*) echo "$GIT_TOKEN" ;;
+      esac
+      SCRIPT
+    - chmod +x /tmp/git-askpass.sh
+    - export GIT_ASKPASS=/tmp/git-askpass.sh GIT_TERMINAL_PROMPT=0 GIT_TOKEN="${CI_JOB_TOKEN}"
+    # 合并目标分支
+    - git config user.email "ci@example.local" && git config user.name "CI"
+    # 手动触发时没有 MR 目标分支，跳过合并
+    - |
+      if [ -n "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}" ]; then
+        git fetch origin $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+        git merge origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME --no-edit
+      fi
+    - pip install torch==${TORCH_VERSION} numpy==${NUMPY_VERSION}
+    - bash .github/scripts/install_with_torch.sh torchvision ${TORCH_VERSION}
+    - bash .github/scripts/install_with_torch.sh triton ${TORCH_VERSION}
+    - bash .github/scripts/install_with_torch.sh apex ${TORCH_VERSION}
+    - bash .github/scripts/install_with_torch.sh flash_attn ${TORCH_VERSION}
+    - pip install amdsmi cupy
+    - pip install -r .github/scripts/requirements.txt 
+    - pip install auditwheel patchelf==0.17.2.4 ciupload
+    - mkdir -p ${REPORTS_DIR}
+  script:
+    - export WORK_SPACE="${CI_PROJECT_DIR}"
+    - export LOG="${REPORTS_DIR}"
+    - |
+      set +e
+      bash .github/scripts/compile.sh > compile.log 2>&1
+      tar -czf log.tar.gz compile.log
+      COMPILE_EXIT=$?
+      set -e
+      tail -n 100 compile.log
+    - bash .github/scripts/repair_manylinux.sh -i http://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com 
+    - DTK_VER=$(echo ${DTK_PKG} | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
+    - LOCAL_VER="$(git rev-parse --short=6 HEAD)"
+    - CIUpload REPAIR --dtk_version ${DTK_VER} --torch_version ${TORCH_VERSION} --git_commit ${LOCAL_VER} --outputdir output -f dist/*manylinux*.whl
+    - |
+      ls output/*.whl
+      WHEEL=$(ls output/*manylinux*.whl 2>/dev/null | head -n1)
+      [ -n "${WHEEL}" ] || WHEEL=$(ls output/*.whl | head -n1)
+      pip install --force-reinstall "${WHEEL}" --no-deps
+    - pip list
+    - |
+      set +e
+      bash .github/scripts/test.sh
+      TEST_EXIT=$?
+      set -e
+      exit ${TEST_EXIT}
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - log.tar.gz
+      - output/*.whl
+      - reports/**/*.xml
+    reports:
+      junit:
+        - reports/**/*.xml
+
+publish:
+  stage: publish
+  timeout: 3h
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ /^ds-v0.19.7-dev$/'
+  tags:
+    - nmz
+  parallel:
+    matrix:
+      - PY_VERSION: "3.10"
+        NUMPY_VERSION: "1.24.3"
+        IMAGE: "harbor.sourcefind.cn:5443/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.10-mkl2020.4.304"
+        TORCH_VERSION: ["2.10.0", "2.11.0"]
+      - PY_VERSION: "3.12"
+        NUMPY_VERSION: "1.26.2"
+        IMAGE: "harbor.sourcefind.cn:5443/dcu/admin/base/dev:rockylinux8.6-mpi5.0-gcc10.3-cmake3.29-py3.12-mkl2020.4.304"
+        TORCH_VERSION: ["2.10.0", "2.11.0"]
+  image: ${IMAGE}
+  before_script:
+    # 安装 DTK
+    - cp -f ${DTK_PKG} /opt/
+    - cd /opt && tar -xzf $(basename ${DTK_PKG}) && mv dtk-* dtk
+    - source /opt/dtk/env.sh && cd ${CI_PROJECT_DIR}
+    # 安装 AICC
+    - src_dir="/ArchivedFile/ai_cc/nightly"
+    - latest_run=$(cd "$src_dir" && ls dtk_llvm_*.run 2>/dev/null | sed 's/\.run$//' | sort -t '_' -k4 -nr | head -n1)
+    - 'echo "完整安装包路径: ${src_dir}/${latest_run}.run"'
+    - test -n "${latest_run}" && cp "${src_dir}/${latest_run}.run" ./ && chmod +x "${latest_run}.run" && yes | bash "${latest_run}.run" && echo "AICC 安装完成" || echo "跳过 AICC 安装"
+    - pip install torch==${TORCH_VERSION} numpy==${NUMPY_VERSION}
+    - bash .github/scripts/install_with_torch.sh torchvision ${TORCH_VERSION}
+    - pip install amdsmi cupy
+    - pip install -r .github/scripts/requirements.txt -i http://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com 
+    - pip install auditwheel patchelf==0.17.2.4 ciupload
+    - mkdir -p ${REPORTS_DIR}
+  script:
+    - export WORK_SPACE="${CI_PROJECT_DIR}"
+    - |
+      set +e
+      bash .github/scripts/compile.sh > compile.log 2>&1
+      tar -czf log.tar.gz compile.log
+      COMPILE_EXIT=$?
+      set -e
+      tail -n 100 compile.log
+    - bash .github/scripts/repair_manylinux.sh 
+    - DTK_VER=$(echo ${DTK_PKG} | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
+    - LOCAL_VER="$(git rev-parse --short=6 HEAD)"
+    - CIUpload REPAIR --dtk_version ${DTK_VER} --torch_version ${TORCH_VERSION} --git_commit ${LOCAL_VER} --outputdir output -f dist/*manylinux*.whl
+    - CIUpload NIGHTLY --password ${devpi_nightly_password} --dtk_pkg_name $(basename ${DTK_PKG}) -f output/*.whl --record
+  artifacts:
+    paths:
+      - log.tar.gz
+      - output/*.whl
+    expire_in: 30 days

@@ -1,0 +1,28 @@
+# pytest-timeout 2.5.x 使用 addini(type="float")，与 pytest 8.x 不兼容（启动即 AssertionError）。
+# requirements/requirements-dev.txt 将 pytest 钉在 <8.4.0，因此这里钉住 pytest 8 兼容的 2.3.1。
+pytest-timeout==2.3.1
+setuptools==79.0.1
+wheel
+appdirs
+pluggy
+iniconfig
+execnet
+comet-ml
+tensorboard
+wandb
+datasets
+sphinx
+sphinx-rtd-theme
+mup
+pre-commit
+pytest-forked
+recommonmark
+evaluate
+platformdirs
+docker_pycreds
+sentry-sdk
+mpi4py
+tabulate
+pytorch-lightning
+transformers
+accelerate

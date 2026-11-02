@@ -3,7 +3,7 @@ name: PR Test (HCU)
 on:
     # Run the workflow file from the base branch so PRs (including forks) cannot alter the CI definition.
     pull_request_target:
-        branches: [v0.19.2-dev]
+        branches: [v0.19.2-dev, v0.19.7-dev]
         types: [opened, synchronize, reopened, ready_for_review]
     workflow_dispatch:
         inputs:
@@ -86,6 +86,7 @@ jobs:
                 - /opt/hyhal/:/opt/hyhal/:ro
             # No --privileged: the job runs fork code, and a privileged container can take over the host.
             options: >-
+                --privileged
                 --shm-size=16g
                 --device=/dev/kfd
                 --device=/dev/dri

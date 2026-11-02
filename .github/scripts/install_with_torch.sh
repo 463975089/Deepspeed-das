@@ -3,6 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
+
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 # install_with_torch.sh - install a PyTorch ecosystem package matching a given torch version
 #
 # Usage:

@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
 
 source /opt/dtk/env.sh
 export PYTHON_VERSION=$(python --version 2>&1 | awk -F '[ .]' '{print $2 "." $3}')

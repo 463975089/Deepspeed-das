@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+
 source /opt/dtk/env.sh
 
 RUN_TEST_SH="${WORK_SPACE}/tests/run_test.sh"

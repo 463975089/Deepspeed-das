@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+
 wget http://42.228.13.241:18000/customized/amdsmi/amdsmi-24.5.3%2B02cbffb.dirty-py3-none-any.whl -O amdsmi-24.5.3%2B02cbffb.dirty-py3-none-any.whl
 pip install amdsmi-24.5.3%2B02cbffb.dirty-py3-none-any.whl
 PYTHON_VERSION=$(python --version 2>&1 | awk -F '[ .]' '{print $2 "." $3}')

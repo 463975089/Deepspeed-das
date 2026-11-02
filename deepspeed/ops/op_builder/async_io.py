@@ -51,7 +51,7 @@ class AsyncIOBuilder(TorchCPUOpBuilder):
                 os.path.join(torch.utils.cpp_extension.ROCM_HOME, "include", "hiprand"),
             ]
         # 'third_party/libaio_build/include' carries the libaio headers shipped for the
-        # DCU/DTK image, where the system libaio-dev package is not installed.
+        # HCU/DTK image, where the system libaio-dev package is not installed.
         return ['csrc/aio/py_lib', 'csrc/aio/common', 'csrc/pin_memory'
                 ] + CUDA_INCLUDE + ['third_party/libaio_build/include']
 

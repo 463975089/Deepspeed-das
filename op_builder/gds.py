@@ -36,7 +36,7 @@ class GDSBuilder(AsyncIOBuilder):
         import torch
         import torch.utils.cpp_extension
         # 'third_party/libaio_build/include' carries the libaio headers shipped for the
-        # DCU/DTK image, where the system libaio-dev package is not installed.
+        # HCU/DTK image, where the system libaio-dev package is not installed.
         SRC_INCLUDE = ['csrc/aio/py_lib', 'csrc/aio/common', 'csrc/pin_memory']
         LIBAIO_INCLUDE = ['third_party/libaio_build/include']
         if self.is_rocm_pytorch():

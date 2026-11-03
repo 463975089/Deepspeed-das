@@ -14,7 +14,7 @@ fi
 # 统计失败的测试命令数。任何一项失败都要让整个脚本以非零退出码结束，
 # 否则 GitLab 任务会一直显示为“成功”（假绿）。
 FAILURES=0
-pip install transformers==4.46.3
+pip install transformers==5.18.0
 # 执行一条测试命令并统计失败（失败后继续执行剩余测试，最终统一判定退出码）。
 record() {
     local rc=0

@@ -3,7 +3,8 @@ name: PR Test (HCU)
 on:
     # Run the workflow file from the base branch so PRs (including forks) cannot alter the CI definition.
     pull_request_target:
-        branches: [v0.19.2-dev, v0.19.7-dev]
+        branches: 
+          - v0.19.7-dev
         types: [opened, synchronize, reopened, ready_for_review]
     workflow_dispatch:
         inputs:
@@ -14,11 +15,11 @@ on:
             torch-version:
                 description: 'Torch version to test'
                 required: false
-                default: '2.10.0'
+                default: '2.13.0'
             dtk-pkg:
                 description: 'Path to DTK package'
                 required: false
-                default: '/ArchivedFile/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz'
+                default: '/ArchivedFile/dtk-pkg/dtk26.10/DTK-26.10-Rocky8.6-x86_64.tar.gz'
     # cron is UTC: 16:00 UTC is midnight Beijing time.
     schedule:
         - cron: '0 16 * * *'
@@ -36,8 +37,8 @@ env:
   PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}
   DEVPI_URL: ${{ vars.DEVPI_URL }}
   # PR runs have no inputs, so fall back to the defaults.
-  DTK_PKG: ${{ inputs.dtk-pkg || '/ArchivedFile/dtk-pkg/dtk26.04/DTK-26.04-rc4-centos8-x86_64.tar.gz' }}
-  TORCH_VERSION: ${{ inputs.torch-version || '2.10.0' }}
+  DTK_PKG: ${{ inputs.dtk-pkg || '/ArchivedFile/dtk-pkg/dtk26.10/DTK-26.10-Rocky8.6-x86_64.tar.gz' }}
+  TORCH_VERSION: ${{ inputs.torch-version || '2.13.0' }}
 jobs:
     # The nightly full suite takes about 6 hours, so skip it when nothing was merged that day,
     # but still run it once every 7 idle days to catch environment drift (DTK, pip packages, runner).
@@ -130,72 +131,29 @@ jobs:
                 cd /opt && tar -xzf $(basename ${DTK_PKG}) && mv dtk-* dtk
                 yum install -y libaio-devel
                 yum install -y libaio
-                src_dir="/ArchivedFile/ai_cc/Nightly"
-                latest_run=$(cd "${src_dir}" && find . -maxdepth 1 -type f -name 'dtk_llvm_aicc-1.0.0*.run' -printf '%f\n' | sed 's/\.run$//' | sort -t '_' -k4 -nr | head -n1)
-                if [[ -n "${latest_run}" ]]; then
-                    cp "${src_dir}/${latest_run}.run" "${GITHUB_WORKSPACE}/"
-                    cd "${GITHUB_WORKSPACE}"
-                    chmod +x "${latest_run}.run"
-                    printf 'y\n' | bash "${latest_run}.run"
-                    echo "AICC installation completed"
-                else
-                    echo "No AICC installer found; skipping installation"
-                fi
-            - name: install Python dependencies
+                bash .github/scripts/hcu_llvm_install.sh
+    
+            - name: install pytorch
               shell: bash
               run: |
                 source /opt/dtk/env.sh
                 mkdir -p ~/.pip
                 cat > ~/.pip/pip.conf << EOF
                 [global]
-                    index-url = http://10.16.1.201:9929/nightly/dtk2604/+simple/
+                    index-url = http://10.16.1.201:9929/nightly/dtk2610/+simple/
                     trusted-host = 10.16.1.201
                 EOF
-                cd "${GITHUB_WORKSPACE}"
                 pip install torch==${TORCH_VERSION}
-                bash .github/scripts/install_with_torch.sh torchvision ${TORCH_VERSION} 0.25.0
-                bash .github/scripts/install_with_torch.sh triton ${TORCH_VERSION} 3.6.0
-                bash .github/scripts/install_with_torch.sh apex ${TORCH_VERSION} 1.7.0
-                bash .github/scripts/install_with_torch.sh flash_attn ${TORCH_VERSION} 2.8.3
-                pip3 install -r  requirements/requirements-autotuning-ml.txt  -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
-                pip3 install -r  requirements/requirements-1bit-mpi.txt  -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
-                pip3 install -r  requirements/requirements-autotuning.txt  -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
-                pip3 install -r  requirements/requirements-inf.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
-                pip3 install -r  requirements/requirements-sd.txt  -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
-                sed -i 's/^numpy$/numpy==1.24.3/' requirements/requirements.txt
-                pip install -r requirements/requirements.txt   -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
-                pip install -r requirements/requirements-dev.txt  --no-deps -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
-                bash .github/scripts/requirements.sh
+                bash .github/scripts/install_with_torch.sh torchvision ${TORCH_VERSION}
+                bash .github/scripts/install_with_torch.sh triton ${TORCH_VERSION}
+                bash .github/scripts/install_with_torch.sh apex ${TORCH_VERSION}
+                bash .github/scripts/install_with_torch.sh flash_attn ${TORCH_VERSION}
+                
             
             - name: build whl
               shell: bash
               run: |
-                set -e
-                source /opt/dtk/env.sh
-                export BUILD_ROOT=${GITHUB_WORKSPACE}
-                export PYTHON_VERSION=$(python --version 2>&1 | awk -F '[ .]' '{print $2 "." $3}')
-                export LD_LIBRARY_PATH=/usr/local/lib/python${PYTHON_VERSION}/site-packages/torch/lib:$BUILD_ROOT/third_party/libaio_build/lib:$LD_LIBRARY_PATH
-                export LD_LIBRARY_PATH=/usr/local/lib/python${PYTHON_VERSION}/site-packages/torch/lib:$LD_LIBRARY_PATH
-                export C_INCLUDE_PATH=$BUILD_ROOT/third_party/libaio_build/include:$C_INCLUDE_PATH
-                export C_PLUS_INCLUDE_PATH=$C_INCLUDE_PATH
-                export CFLAGS="-I$BUILD_ROOT/third_party/libaio_build/include/ -w"
-                export CXXFLAGS="-w"
-                export LDFLAGS="-L$BUILD_ROOT/third_party/libaio_build/lib/"
-                export HSA_FORCE_FINE_GRAIN_PCIE=1
-                export HIP_VISIBLE_DEVICES=0,1,2,3
-                export LD_LIBRARY_PATH=/usr/local/lib/python3.10/site-packages/hcusmi:$LD_LIBRARY_PATH
-                python3 --version
-                echo ${PYTHON_VERSION}
-                python -c "import torch, os; print(os.path.dirname(torch.__file__))"
-                echo "obtain the path of the torch"
-                TORCH_PATH=$(python -c "import torch, os; print(os.path.dirname(torch.__file__))" 2>/dev/null)
-                echo "${TORCH_PATH}"
-                export LD_LIBRARY_PATH=${TORCH_PATH}/lib:$LD_LIBRARY_PATH
-                echo $LD_LIBRARY_PATH
-                export CXX=hipcc
-                export CC=hipcc
-                DS_BUILD_SPARSE_ATTN=0 DS_BUILD_EVOFORMER_ATTN=0 DS_BUILD_CUTLASS_OPS=0 DS_BUILD_FP_QUANTIZER=0  DS_BUILD_OPS=1  DS_ACCELERATOR='cuda' python3 setup.py install bdist_wheel
-                pip install dist/*.whl
+                bash .github/scripts/compile.sh
             
             # The full suite takes about 6 hours, so it runs nightly or on demand rather than on every PR.
             - name: run full tests

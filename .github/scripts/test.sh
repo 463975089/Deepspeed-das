@@ -2,6 +2,13 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
+# Default to the repo root so CI checkouts work; override WORK_SPACE for a custom layout.
+WORK_SPACE="${WORK_SPACE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+# CI sets REPORTS_DIR so all logs land in one place for artifact upload.
+REPORTS_DIR="${REPORTS_DIR:-${WORK_SPACE}/tests}"
+LOG="${LOG:-${REPORTS_DIR}/unit_test_logs}"
+mkdir -p "${LOG}"
+TIMEOUT="${TIMEOUT:-10800}"
 source /opt/dtk/env.sh
 
 RUN_TEST_SH="${WORK_SPACE}/tests/run_test.sh"

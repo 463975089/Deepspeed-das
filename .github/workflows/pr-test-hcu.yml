@@ -3,7 +3,8 @@ name: PR Test (HCU)
 on:
     # Run the workflow file from the base branch so PRs (including forks) cannot alter the CI definition.
     pull_request_target:
-        branches: [v0.19.2-dev, v0.19.7-dev]
+        branches: 
+          - v0.19.7-dev
         types: [opened, synchronize, reopened, ready_for_review]
     workflow_dispatch:
         inputs:
@@ -131,9 +132,7 @@ jobs:
                 yum install -y libaio-devel
                 yum install -y libaio
                 bash .github/scripts/hcu_llvm_install.sh
-                else
-                    echo "No AICC installer found; skipping installation"
-                fi
+    
             - name: install pytorch
               shell: bash
               run: |

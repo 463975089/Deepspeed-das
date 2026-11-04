@@ -41,6 +41,27 @@ check_aicc() {
 
 install_dependencies(){
     echo "install env"
+    wget http://42.228.13.241:18000/customized/amdsmi/amdsmi-24.5.3%2B02cbffb.dirty-py3-none-any.whl -O amdsmi-24.5.3%2B02cbffb.dirty-py3-none-any.whl
+    pip install amdsmi-24.5.3%2B02cbffb.dirty-py3-none-any.whl
+    pip install scipy==1.14.1
+    pip install cupy
+    pip install pytest-timeout -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
+    pip install setuptools==79.0.1 wheel  -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
+    pip install --upgrade pip
+    pip install appdirs -i https://mirrors.huaweicloud.com/artifactory/pypi-public/simple
+    pip install  pluggy -i https://mirrors.huaweicloud.com/artifactory/pypi-public/simple
+    pip install  iniconfig  -i https://mirrors.huaweicloud.com/artifactory/pypi-public/simple
+    pip install  execnet  -i https://mirrors.huaweicloud.com/artifactory/pypi-public/simple
+    pip install  comet-ml tensorboard wandb datasets sphinx sphinx-rtd-theme mup pre-commit pytest-forked recommonmark -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
+    pip install  evaluate  -i https://mirrors.huaweicloud.com/artifactory/pypi-public/simple
+
+    pip install platformdirs -i https://mirrors.huaweicloud.com/artifactory/pypi-public/simple
+    pip install docker_pycreds  -i https://mirrors.huaweicloud.com/artifactory/pypi-public/simple
+    pip install sentry-sdk -i https://mirrors.huaweicloud.com/artifactory/pypi-public/simple
+    pkgs=("mpi4py" "tabulate" "pytorch-lightning" "transformers" "accelerate")
+    for pkg in ${pkgs[@]};do
+        pip install ${pkg} -i http://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+    done
     pip3 install -r  requirements/requirements-autotuning-ml.txt  -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
     pip3 install -r  requirements/requirements-1bit-mpi.txt  -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
     pip3 install -r  requirements/requirements-autotuning.txt  -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
@@ -49,7 +70,6 @@ install_dependencies(){
     sed -i 's/^numpy$/numpy==2.1.0/' requirements/requirements.txt
     pip install -r requirements/requirements.txt   -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
     pip install -r requirements/requirements-dev.txt  --no-deps -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
-    bash .github/scripts/requirements.sh
 }
 
 check_torch

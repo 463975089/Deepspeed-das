@@ -31,7 +31,7 @@ https://github.com/snowflakedb/ArcticTraining/blob/main/projects/sequence-parall
 
 from collections import defaultdict, deque
 from deepspeed.runtime.utils import see_memory_usage
-from deepspeed.sequence.layer import _DimZeroAllToAll
+from deepspeed.sequence.layer import _dim_zero_all_to_all, register_all_to_all_group
 from deepspeed.utils.logging import logger
 from einops import rearrange
 from packaging import version
@@ -105,6 +105,9 @@ class UlyssesSPAttentionHF(torch.nn.Module):
         super().__init__()
         self.attn = attn
         self.process_group = process_group
+        # the exchange operator resolves its group by name, and the registry has to be written here
+        # rather than at call time, which may be inside a compiled region
+        register_all_to_all_group(process_group)
         self.world_size = dist.get_world_size(process_group)
         self.sp_rank = dist.get_rank(process_group)
 
@@ -189,7 +192,7 @@ class UlyssesSPAttentionHF(torch.nn.Module):
 
             input = rearrange(input, "sl_l bs ws hc_l hs -> ws sl_l bs hc_l hs").contiguous()
 
-            output = _DimZeroAllToAll.apply(self.process_group, input)
+            output = _dim_zero_all_to_all(self.process_group, input)
 
             # [ws sl_l bs hc_l hs] -> [sl bs hc_l hs]
             output = output.reshape([self.global_seq_length, *output.shape[2:]]).contiguous()
@@ -217,7 +220,7 @@ class UlyssesSPAttentionHF(torch.nn.Module):
             self.attn_head_size * self.attn_head_count // self.world_size,
         ]).contiguous()
 
-        output = _DimZeroAllToAll.apply(self.process_group, input)
+        output = _dim_zero_all_to_all(self.process_group, input)
         output = rearrange(output, "ws sl_l bs em_l -> sl_l bs ws em_l")
 
         # [sl_l bs ws em_l] -> [sl_l bs em]
@@ -1026,8 +1029,10 @@ class TiledMLP(torch.autograd.Function):
         x_shape_orig = x.shape
 
         # flatten bs+seqlen to avoid having stride issues when narrowing into seqlen w/ bs>1
-        x = x.view(-1, hidden_size)
-        incoming_grad = grads[0].view(-1, hidden_size)
+        # reshape rather than view: a caller may pass a non-contiguous x or incoming grad (a transposed or
+        # channel-sliced activation), for which view cannot produce the flattened shape
+        x = x.reshape(-1, hidden_size)
+        incoming_grad = grads[0].reshape(-1, hidden_size)
         x_grad = torch.zeros_like(x)
 
         x_shards = list(torch.chunk(x, chunks=shards, dim=0))
@@ -1143,10 +1148,12 @@ class TiledFusedLogitsLoss(torch.autograd.Function):
         bs, seqlen = x.shape[:2]
 
         # flatten bs+seqlen to avoid having stride issues when narrowing into seqlen w/ bs>1
-        x = x.view(-1, *x.shape[2:])
-        y = y.view(-1, *y.shape[2:])
+        # reshape rather than view: a caller may pass a non-contiguous x, y or mask (a transposed or
+        # channel-sliced activation), for which view cannot produce the flattened shape
+        x = x.reshape(-1, *x.shape[2:])
+        y = y.reshape(-1, *y.shape[2:])
         if mask is not None:
-            mask = mask.view(-1)
+            mask = mask.reshape(-1)
         incoming_grad = torch.tensor(1.0, dtype=x.dtype, device=x.device)
 
         # we are faking the incoming gradient, and since we perform a reduction outside of `autograd.backward` below we need to pre-adjust the incoming gradient. in the case of "sum" the gradient is 1.0, in the case of "mean" it's 1.0/num_elements, which in this case is 1/shards.

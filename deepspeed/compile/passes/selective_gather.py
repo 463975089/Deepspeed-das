@@ -15,8 +15,12 @@ from deepspeed.utils import log_dist
 
 from ..util import get_deepcompile_handle
 from ..graph_param import DSGraphParamManager
+from ..profilers.graph_profile import is_profile_incomplete
+from .contract import PassContract, CAP_Z3_GATHER_RELEASE
 
 NAME = "selective_gather"
+# Chooses which zero3_compile all-gathers to keep resident, so it depends on that pass.
+CONTRACT = PassContract(requires=frozenset({CAP_Z3_GATHER_RELEASE}))
 
 max_alloc_mem = 0
 last_optimize_step = 0
@@ -25,6 +29,18 @@ MEM_MARGIN = 0.1
 
 def print_rank_0(message):
     log_dist(message, ranks=[0])
+
+
+def _maybe_update_size_from_profile(ds_id_to_size: Dict[int, int], ds_id: int, tensor_size: int) -> None:
+    if tensor_size > 0:
+        ds_id_to_size[ds_id] = tensor_size
+
+
+def _time_per_byte(ds_id_to_time: Dict[int, float], ds_id_to_size: Dict[int, int], ds_id: int) -> float:
+    size = ds_id_to_size.get(ds_id, 0)
+    if size <= 0:
+        return 0.0
+    return ds_id_to_time[ds_id] / size
 
 
 def _compute_persistence_budget(all_graph_mem_records: List[List[Tuple[str, int, int, int]]], total_mem: int,
@@ -41,7 +57,7 @@ def _compute_persistence_budget(all_graph_mem_records: List[List[Tuple[str, int,
             "profiled_list_count": 0,
         }
 
-    # Persistent parameters add to live allocations that remain resident past an op boundary.
+    # Persistent parameters stay live during transient allocations inside an op.
     peak_resident_alloc = max(record[1] for mem_records in non_empty_records for record in mem_records)
     transient_peak = max(record[3] for mem_records in non_empty_records for record in mem_records)
 
@@ -49,14 +65,20 @@ def _compute_persistence_budget(all_graph_mem_records: List[List[Tuple[str, int,
         "usable_mem": usable_mem,
         "peak_resident_alloc": peak_resident_alloc,
         "transient_peak": transient_peak,
-        "available_mem": max(0, usable_mem - peak_resident_alloc),
+        "available_mem": max(0, usable_mem - transient_peak),
         "profiled_list_count": len(non_empty_records),
     }
+
+
+def _profile_result_incomplete(prof) -> bool:
+    return (is_profile_incomplete(prof.fwd_graph) or is_profile_incomplete(prof.bwd_graph) or not prof.fwd_mem_complete
+            or (prof.needs_backward and not prof.bwd_mem_complete))
 
 
 def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], profiling_results,
                      create_inputs_fn, mem_budget: float, param_manager: DSGraphParamManager,
                      bwd: bool) -> GraphModule:
+    """Persist high-value parameters only on the final backward graph and within measured headroom."""
     target_graph_id = graph_id
 
     if not bwd:
@@ -70,6 +92,15 @@ def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int
 
     # Run only on the last backward graph
     if last_backward_graph_id is None or graph_id != last_backward_graph_id:
+        return gm
+
+    process_group = getattr(profiling_results[graph_id], "process_group", None)
+    incomplete_profile_ids = [
+        profile_graph_id for profile_graph_id, prof in profiling_results.items() if _profile_result_incomplete(prof)
+    ]
+    if incomplete_profile_ids:
+        print_rank_0(f"selective_gather incomplete profiling data for graph_ids={incomplete_profile_ids}; "
+                     "skipping persistence update")
         return gm
 
     all_graph_mem_records = []
@@ -106,7 +137,7 @@ def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int
         for n in profile.fwd_graph.nodes:
             if n.target == torch.ops.dc.allgather_param.default:
                 assert "tensor_size" in n.meta
-                ds_id_to_size[n.args[2]] = n.meta["tensor_size"]
+                _maybe_update_size_from_profile(ds_id_to_size, n.args[2], n.meta["tensor_size"])
                 assert "device_time" in n.meta
                 ds_id_to_time[n.args[2]] += n.meta["device_time"]
 
@@ -117,12 +148,12 @@ def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int
             for n in profile.bwd_graph.nodes:
                 if n.target == torch.ops.dc.allgather_param.default:
                     assert "tensor_size" in n.meta
-                    ds_id_to_size[n.args[2]] = n.meta["tensor_size"]
+                    _maybe_update_size_from_profile(ds_id_to_size, n.args[2], n.meta["tensor_size"])
                     assert "device_time" in n.meta
                     ds_id_to_time[n.args[2]] += n.meta["device_time"]
 
     ds_ids = [ds_id for ds_id in ds_id_to_size if ds_id not in persistent_ds_ids]
-    ds_ids.sort(key=lambda ds_id: ds_id_to_time[ds_id] / ds_id_to_size[ds_id], reverse=True)
+    ds_ids.sort(key=lambda ds_id: _time_per_byte(ds_id_to_time, ds_id_to_size, ds_id), reverse=True)
 
     # print(f"ds_id_to_size={ds_id_to_size}")
     # print(f"ds_id_to_time={ds_id_to_time}")
@@ -141,12 +172,16 @@ def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int
     current_available_mem = accelerator.available_memory()
     vals_to_bcast = torch.tensor([total_mem, current_available_mem],
                                  device=torch.device(get_accelerator().current_device()))
-    dist.all_reduce(vals_to_bcast, dist.ReduceOp.MIN)
+    dist.all_reduce(vals_to_bcast, dist.ReduceOp.MIN, group=process_group)
     total_mem = vals_to_bcast[0].item()
     current_available_mem = vals_to_bcast[1].item()
 
     budget = _compute_persistence_budget(all_graph_mem_records, total_mem, MEM_MARGIN)
-    available_mem = int(current_available_mem * (1 - MEM_MARGIN))
+    profiled_available_mem = budget["available_mem"]
+    current_available_headroom = max(0, int(current_available_mem) - int(total_mem * MEM_MARGIN))
+    # The profile models transient peaks, while current allocator state captures
+    # memory retained since profiling.  Persistence must satisfy both views.
+    available_mem = min(profiled_available_mem, current_available_headroom)
 
     ds_id_to_param = {}
     for g_id, g_pm in param_manager.items():
@@ -160,7 +195,8 @@ def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int
         f"selective_gather target_graph_id={target_graph_id} profiled_mem_lists={budget['profiled_list_count']} "
         f"total_mem={total_mem} usable_mem={budget['usable_mem']} peak_resident_alloc={budget['peak_resident_alloc']} "
         f"transient_peak={budget['transient_peak']} current_available_mem={current_available_mem} "
-        f"usable_available_mem={available_mem} "
+        f"current_available_headroom={current_available_headroom} "
+        f"profiled_transient_available_mem={profiled_available_mem} effective_available_mem={available_mem} "
         f"persistent_count={len(persistent_ds_ids)} persistent_bytes={persistent_bytes} "
         f"candidate_count={len(ds_ids)} candidate_bytes={candidate_bytes}")
 
@@ -173,7 +209,7 @@ def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int
         return gm
 
     if available_mem == 0:
-        print_rank_0("selective_gather no currently available memory for new persistent params")
+        print_rank_0("selective_gather no effective headroom for new persistent params")
         return gm
 
     persistent_mem = 0

@@ -60,10 +60,15 @@ def is_backend_inductor(backend):
 
 backward_started = False
 pre_backward_hooks = []
+post_backward_hooks = []
 
 
 def add_pre_backward_hook(hook):
     pre_backward_hooks.append(hook)
+
+
+def add_post_backward_hook(hook):
+    post_backward_hooks.append(hook)
 
 
 def deepcompile_backward_prologue(is_gradient_accumulation_boundary):
@@ -73,6 +78,11 @@ def deepcompile_backward_prologue(is_gradient_accumulation_boundary):
 
     dc = get_deepcompile_handle()
     dc.start_backward(is_gradient_accumulation_boundary)
+
+
+def deepcompile_backward_epilogue():
+    for hook in post_backward_hooks:
+        hook()
 
 
 def log_rank0(msg: str, enable: bool = False):
@@ -228,7 +238,7 @@ def materialize_fake(v, device=None):
                                        device=t.device if device is None else device,
                                        layout=t.layout,
                                        requires_grad=t.requires_grad,
-                                       pin_memory=t.is_pinned())
+                                       pin_memory=get_accelerator().is_pinned(t))
                 else:
                     return torch.zeros(t.shape,
                                        dtype=t.dtype,
@@ -252,7 +262,7 @@ def get_last_uses(graph: Graph):
         known_last_use = None
 
         if user.target in no_copy_ops and n in node_to_last_use:
-            last_user = node_to_last_use[user]
+            last_user = node_to_last_use.get(user, user)
             last_use_position = position[last_user]
 
             known_last_use = node_to_last_use[n]
@@ -261,7 +271,7 @@ def get_last_uses(graph: Graph):
 
         if n not in node_to_last_use or update:
             if user.target in no_copy_ops:
-                user = node_to_last_use[user]
+                user = node_to_last_use.get(user, user)
 
             node_to_last_use[n] = user
             user_to_last_uses.setdefault(user, []).append(n)

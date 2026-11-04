@@ -5,32 +5,34 @@
 
 import torch
 from deepspeed.accelerator.abstract_accelerator import DeepSpeedAccelerator
-import intel_extension_for_pytorch as ipex  # noqa: F401 # type: ignore
-import oneccl_bindings_for_pytorch  # noqa: F401 # type: ignore
 import functools
-
 import importlib
 import inspect
+
+try:
+    import oneccl_bindings_for_pytorch  # noqa: F401 # type: ignore
+    oneccl_imported_p = True
+except ImportError as e:
+    oneccl_imported_p = False
 
 
 class XPU_Accelerator(DeepSpeedAccelerator):
 
     def __init__(self):
         self._name = 'xpu'
-        self._communication_backend_name = 'ccl'
+        if oneccl_imported_p:
+            self._communication_backend_name = 'ccl'
+        else:
+            # changed to xccl if not using torch-CCL on XPU device
+            self._communication_backend_name = 'xccl'
         self._compile_backend = "inductor"
-        self.aligned_tensors = []
         self.class_dict = None
 
     def is_synchronized_device(self):
         return False
 
     def use_host_timers(self):
-        # WA XPU event will be consolidated in 2.6
-        if ipex.__version__ < '2.6':
-            return True
-        else:
-            return self.is_synchronized_device()
+        return self.is_synchronized_device()
 
     def resolves_data_dependency(self):
         return self.is_synchronized_device()
@@ -45,7 +47,7 @@ class XPU_Accelerator(DeepSpeedAccelerator):
         return 'xpu:{}'.format(device_index)
 
     def device(self, device_index=None):
-        return torch.xpu.device(device_index)
+        return torch.device('xpu', device_index)
 
     def set_device(self, device_index):
         torch.xpu.set_device(device_index)
@@ -150,18 +152,15 @@ class XPU_Accelerator(DeepSpeedAccelerator):
         return self.total_memory(device_index) - self.memory_allocated(device_index)
 
     # Misc
-    def amp(self):
-        return torch.xpu.amp
-
     def is_available(self):
         return torch.xpu.is_available()
 
-    def range_push(self, msg):
+    def range_push(self, msg, domain=None, category=None):
         # TODO itt is currently not supported yet
         # return torch.profiler.itt.range_push(msg)
         return
 
-    def range_pop(self):
+    def range_pop(self, domain=None):
         # TODO itt is currently not supported yet
         # return torch.profiler.itt.range_pop()
         return
@@ -229,25 +228,16 @@ class XPU_Accelerator(DeepSpeedAccelerator):
     def LongTensor(self):
         return functools.partial(torch.tensor, dtype=torch.long, device=self._name)
 
-    def pin_memory(self, tensor, align_bytes=1):
-        if align_bytes == 1:
-            return tensor.pin_memory(device=self.current_device_name())
-        elif align_bytes == 0:
-            from deepspeed.ops.op_builder.xpu import AsyncIOBuilder
-            self.aio_handle = AsyncIOBuilder().load().aio_handle(128 * 1024, 8, False, False, False)
-            aligned_t = self.aio_handle.new_cpu_locked_tensor(tensor.numel(), tensor)
-            aligned_t = aligned_t[:tensor.numel()].copy_(tensor)
-            self.aligned_tensors.append([aligned_t.data_ptr(), aligned_t[-1].data_ptr()])
-            return aligned_t
+    def _torch_pin_memory(self, tensor):
+        return tensor.pin_memory(device=self.current_device_name())
 
-    def is_pinned(self, tensor):
-        if tensor.is_pinned(device=self.current_device_name()):
-            return True
-        else:
-            for begin, end in self.aligned_tensors:
-                if begin <= tensor.data_ptr() and tensor.data_ptr() <= end:
-                    return True
-        return False
+    def _torch_empty_pinned(self, tensor, shape):
+        # Pinning on XPU needs an explicit device, which the allocation API
+        # cannot express, so allocate and then pin.
+        return self._torch_pin_memory(tensor.new_empty(shape))
+
+    def _torch_is_pinned(self, tensor):
+        return tensor.is_pinned(device=self.current_device_name())
 
     def op_builder_dir(self):
         try:
@@ -290,11 +280,8 @@ class XPU_Accelerator(DeepSpeedAccelerator):
             return self.class_dict['NotImplementedBuilder']
 
     def build_extension(self):
-        try:
-            from intel_extension_for_pytorch.xpu.cpp_extension import DpcppBuildExtension
-        except ImportError:
-            from intel_extension_for_pytorch.xpu.utils import DpcppBuildExtension
-        return DpcppBuildExtension
+        from torch.utils.cpp_extension import BuildExtension
+        return BuildExtension
 
     def export_envs(self):
         return []

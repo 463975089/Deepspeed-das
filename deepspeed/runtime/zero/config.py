@@ -41,6 +41,7 @@ ZeRO optimization should be enabled as:
     "offload_optimizer": {...},
     "ignore_unused_parameters": [true|false],
     "round_robin_gradients": [true|false],
+    "parameter_alignment": [true|false],
     "zero_hpz_partition_size": 1,
     "zero_quantized_weights": [true|false],
     "zero_quantized_nontrainable_weights": [true|false],
@@ -110,7 +111,7 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     Uses reduce or reduce scatter instead of allreduce to average gradients
     """
 
-    reduce_bucket_size: int = Field(pp_int(5e8), ge=0)
+    reduce_bucket_size: int = Field(pp_int(5e8), gt=0)
     """
     Number of elements reduced/allreduced at a time. Limits the memory required
     for the allgather for large model sizes
@@ -140,6 +141,13 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     Attempts to overlap the reduction of the gradients with backward computation
     """
 
+    compute_grad_norm: bool = True
+    """
+    Compute and retain the global gradient norm during ZeRO Stage 1/2 optimizer steps.
+    Disable only when gradient clipping is off, the dedicated ZeRO-1 BF16 optimizer is not selected,
+    and callers do not use ``get_global_grad_norm()``.
+    """
+
     load_from_fp32_weights: bool = True
     """
     Boolean indicating whether to initialize fp32 master weights from fp32
@@ -150,8 +158,8 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
 
     elastic_checkpoint: bool = False
     """
-    Enable loading checkpoint that was saved by job with different GPU count.
-    No longer supported.
+    Legacy elastic checkpoint support. ZeRO-3 elastic checkpointing is no
+    longer supported; use Universal Checkpointing instead.
     """
 
     offload_param: Optional[DeepSpeedZeroOffloadParamConfig] = None
@@ -306,6 +314,14 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     Performance benefit grows with gradient accumulation steps (more copying
     between optimizer steps) or GPU count (increased parallelism).
     """
+
+    parameter_alignment: bool = False
+    """
+    Pad ZeRO Stage 1 and 2 flat buffers between parameters so each parameter
+    starts at a 16-byte-aligned address. This is disabled by default because
+    the padding increases flat-buffer and optimizer-state memory usage.
+    """
+
     zero_hpz_partition_size: int = Field(1, ge=0)
     """
     Number of ranks in zero parameters partitioning secondary group
@@ -337,10 +353,6 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     "zeropp_loco_param": { "err_beta": 0.8, "reset_T": 1024 }.
     See LoCo paper for more details: (https://arxiv.org/abs/2407.04480).
     """
-
-    mics_shard_size: int = Field(-1, json_schema_extra={"new_param": "mics_shard_size"})
-
-    mics_hierarchical_params_gather: bool = False
 
     memory_efficient_linear: bool = True
     """
@@ -386,8 +398,22 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
         return self
 
     @model_validator(mode="after")
+    def compute_grad_norm_valid(self):
+        if not self.compute_grad_norm and self.stage not in (ZeroStageEnum.optimizer_states, ZeroStageEnum.gradients):
+            raise ValueError("compute_grad_norm=false is supported only with ZeRO Stage 1 or 2")
+        return self
+
+    @model_validator(mode="after")
     def offload_ratio_check(self):
         offload_config = self.offload_optimizer
         if offload_config and offload_config.ratio < 1.0:
             assert self.stage == ZeroStageEnum.weights, "Partial offloading only supported for ZeRO Stage 3."
+        return self
+
+    @model_validator(mode="after")
+    def elastic_checkpoint_deprecated(self):
+        if self.stage == ZeroStageEnum.weights and self.elastic_checkpoint:
+            logger.warning(
+                "ZeRO-3 elastic checkpointing is deprecated and no longer supported. Use Universal Checkpointing instead."
+            )
         return self

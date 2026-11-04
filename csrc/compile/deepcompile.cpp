@@ -15,7 +15,8 @@ std::shared_ptr<DoubleBufferedReduceBucket> reduce_buckets = nullptr;
 
 c10::intrusive_ptr<c10d::ProcessGroup> process_group = nullptr;
 c10::intrusive_ptr<c10d::symmetric_memory::SymmetricMemory> symm_mem = nullptr;
-ncclComm_t nccl_comm;
+ncclComm_t nccl_comm = nullptr;
+bool nccl_comm_initialized = false;
 bool use_symm_mem;
 bool profile = false;
 bool pre_div_reduce = true;
@@ -26,6 +27,7 @@ bool sync_before_reduce;     // for debugging
 bool sync_after_reduce;      // for debugging
 bool sync_before_allgather;  // for debugging
 bool sync_after_allgather;   // for debugging
+bool offload_activation_pin_memory = true;
 
 std::vector<int64_t> sizes_to_int_vector(at::IntArrayRef sizes)
 {
@@ -84,10 +86,20 @@ void reset()
 void cleanup()
 {
     reset();
+    if (reduce_buckets) {
+        reduce_buckets->clear();
+        reduce_buckets.reset();
+    }
+    param_registry.reset();
 
-    ncclCommDestroy(nccl_comm);
+    if (nccl_comm_initialized) {
+        ncclCommDestroy(nccl_comm);
+        nccl_comm = nullptr;
+        nccl_comm_initialized = false;
+    }
     process_group = nullptr;
     symm_mem = nullptr;
+    profile = false;
 }
 
 at::Tensor reduce_grad(at::Tensor grad_tensor, long graph_id, long ds_id)
@@ -150,6 +162,7 @@ void init(c10::intrusive_ptr<c10d::ProcessGroup> pg,
     // create a new nccl communicator
     std::memcpy(&ncclID, tensor.to(torch::Device(torch::kCPU)).data_ptr(), NCCL_UNIQUE_ID_BYTES);
     ncclCommInitRank(&nccl_comm, process_group->getSize(), ncclID, process_group->getRank());
+    nccl_comm_initialized = true;
 
     param_registry = std::make_shared<DSParamRegistry>();
     reduce_buckets = std::make_shared<DoubleBufferedReduceBucket>(
@@ -161,6 +174,7 @@ void init(c10::intrusive_ptr<c10d::ProcessGroup> pg,
     sync_after_reduce = get_config<bool>(config, "sync_after_reduce");
     sync_before_allgather = get_config<bool>(config, "sync_before_allgather");
     sync_after_allgather = get_config<bool>(config, "sync_after_allgather");
+    offload_activation_pin_memory = get_config<bool>(config, "offload_activation_pin_memory");
 }
 
 void start_forward()

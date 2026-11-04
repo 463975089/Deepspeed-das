@@ -35,14 +35,19 @@ class GDSBuilder(AsyncIOBuilder):
     def include_paths(self):
         import torch
         import torch.utils.cpp_extension
-        CUDA_INCLUDE = [os.path.join(torch.utils.cpp_extension.HIP_HOME, "include")]
+        # 'third_party/libaio_build/include' carries the libaio headers shipped for the
+        # HCU/DTK image, where the system libaio-dev package is not installed.
+        SRC_INCLUDE = ['csrc/aio/py_lib', 'csrc/aio/common', 'csrc/pin_memory']
+        LIBAIO_INCLUDE = ['third_party/libaio_build/include']
         if self.is_rocm_pytorch():
-            return ['csrc/aio/py_lib', 'csrc/aio/common'] + CUDA_INCLUDE + ["third_party/libaio_build/include"] + ["/opt/hyhal/include"]
-        return ['csrc/aio/py_lib', 'csrc/aio/common'] + CUDA_INCLUDE + ["third_party/libaio_build/include"]
+            HIP_INCLUDE = [os.path.join(torch.utils.cpp_extension.HIP_HOME, "include")]
+            return SRC_INCLUDE + HIP_INCLUDE + LIBAIO_INCLUDE + ["/opt/hyhal/include"]
+        CUDA_INCLUDE = [os.path.join(torch.utils.cpp_extension.CUDA_HOME, "include")]
+        return SRC_INCLUDE + CUDA_INCLUDE + LIBAIO_INCLUDE
 
     def extra_ldflags(self):
         if self.is_rocm_pytorch():
-            return super().extra_ldflags() + ['-L/opt/hyhal/lib','-lhyfile']
+            return super().extra_ldflags() + ['-L/opt/hyhal/lib', '-lhyfile']
         return super().extra_ldflags() + ['-lcufile']
 
     def exist_hyfile(self):
@@ -50,7 +55,7 @@ class GDSBuilder(AsyncIOBuilder):
             return True
         self.warning("Not exist hyfile.h, ignore gds compile")
         return False
-    
+
     def is_compatible(self, verbose=False):
         # if self.is_rocm_pytorch():
         #     if verbose:

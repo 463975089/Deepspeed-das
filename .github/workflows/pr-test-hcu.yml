@@ -140,8 +140,8 @@ jobs:
                 mkdir -p ~/.pip
                 cat > ~/.pip/pip.conf << EOF
                 [global]
-                    index-url = http://10.16.1.201:9929/nightly/dtk2610/+simple/
-                    trusted-host = 10.16.1.201
+                    index-url = ${PIP_INDEX_URL}/nightly/dtk2610/+simple/
+                    trusted-host = ${PIP_TRUSTED_HOST}
                 EOF
                 pip install torch==${TORCH_VERSION}
                 bash .github/scripts/install_with_torch.sh torchvision ${TORCH_VERSION}

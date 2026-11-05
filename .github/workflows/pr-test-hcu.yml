@@ -131,7 +131,7 @@ jobs:
                 cd /opt && tar -xzf $(basename ${DTK_PKG}) && mv dtk-* dtk
                 yum install -y libaio-devel
                 yum install -y libaio
-                bash .github/scripts/hcu_llvm_install.sh
+                bash .github/scripts/hcu_llvm_installer.sh
     
             - name: install pytorch
               shell: bash
@@ -140,7 +140,7 @@ jobs:
                 mkdir -p ~/.pip
                 cat > ~/.pip/pip.conf << EOF
                 [global]
-                    index-url = ${PIP_INDEX_URL}/nightly/dtk2610/+simple/
+                    index-url = ${DEVPI_URL}/nightly/dtk2610/+simple/
                     trusted-host = ${PIP_TRUSTED_HOST}
                 EOF
                 pip install torch==${TORCH_VERSION}

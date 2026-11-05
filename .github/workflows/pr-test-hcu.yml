@@ -3,7 +3,8 @@ name: PR Test (HCU)
 on:
     # Run the workflow file from the base branch so PRs (including forks) cannot alter the CI definition.
     pull_request_target:
-        branches: [v0.19.2-dev, v0.19.7-dev]
+        branches: 
+          - v0.19.2-dev
         types: [opened, synchronize, reopened, ready_for_review]
     workflow_dispatch:
         inputs:
@@ -148,8 +149,8 @@ jobs:
                 mkdir -p ~/.pip
                 cat > ~/.pip/pip.conf << EOF
                 [global]
-                    index-url = http://10.16.1.201:9929/nightly/dtk2604/+simple/
-                    trusted-host = 10.16.1.201
+                    index-url = ${DEVPI_URL}/nightly/dtk2604/+simple/
+                    trusted-host = ${PIP_TRUSTED_HOST}
                 EOF
                 cd "${GITHUB_WORKSPACE}"
                 pip install torch==${TORCH_VERSION}

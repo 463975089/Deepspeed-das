@@ -33,7 +33,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PIP_INDEX_URL: ${{ vars.PIP_INDEX_URL }}
   PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}
   DEVPI_URL: ${{ vars.DEVPI_URL }}
   # PR runs have no inputs, so fall back to the defaults.

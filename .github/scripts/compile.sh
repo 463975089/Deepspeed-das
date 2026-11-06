@@ -6,7 +6,7 @@ set -e
 source /opt/dtk/env.sh
 
 check_torch() {
-   if ! python3 -c "import torch; print(torch.__version__)" 2>/dev/null; then
+   if ! python3 -c "import torch; print(torch.__version__)"; then
       echo "PyTorch is not installed. Please install PyTorch first."
       exit 1
    fi

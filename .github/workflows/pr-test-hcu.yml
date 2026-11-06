@@ -131,6 +131,7 @@ jobs:
                 cd /opt && tar -xzf $(basename ${DTK_PKG}) && mv dtk-* dtk
                 yum install -y libaio-devel
                 yum install -y libaio
+                cd ${GITHUB_WORKSPACE}
                 bash .github/scripts/hcu_llvm_installer.sh
     
             - name: install pytorch

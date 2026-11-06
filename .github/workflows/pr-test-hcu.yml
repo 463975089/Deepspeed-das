@@ -2,7 +2,7 @@ name: PR Test (HCU)
 
 on:
     # Run the workflow file from the base branch so PRs (including forks) cannot alter the CI definition.
-    pull_request_target:
+    pull_request:
         branches: 
           - v0.19.7-dev
         types: [opened, synchronize, reopened, ready_for_review]

@@ -80,7 +80,7 @@ jobs:
         # pull_request_target runs fork code on the self-hosted runner, so require a maintainer approval first.
         timeout-minutes: 720
         container:
-            image: ${{ vars.IMAGE }}
+            image: ${{ vars.IMAGE_DTK2610 }}
             volumes:
                 - /public/opendas/ArchivedFile:/ArchivedFile:ro
                 - /public5:/public5:ro
@@ -127,11 +127,8 @@ jobs:
               shell: bash
               run: |
                 set -eu
-                cp -f ${DTK_PKG} /opt/
-                cd /opt && tar -xzf $(basename ${DTK_PKG}) && mv dtk-* dtk
                 yum install -y libaio-devel
                 yum install -y libaio
-                cd ${GITHUB_WORKSPACE}
                 bash .github/scripts/hcu_llvm_installer.sh
     
             - name: install pytorch

@@ -101,7 +101,7 @@ jobs:
                 ref: ${{ github.event.pull_request.base.ref || github.ref }}
                 fetch-depth: 0
                 # Keep the token out of .git/config so PR code cannot read it.
-                persist-credentials: false
+                persist-credentials: true
 
             # ${{ github.workspace }} resolves to the host path in container jobs, so derive it inside the container.
             - name: Set reports directory

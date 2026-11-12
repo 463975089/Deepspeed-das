@@ -94,13 +94,15 @@ jobs:
                 persist-credentials: true
 
             - name: Setup HCU environment
-              uses: ./.github/actions/setup-hcu
-              with:
-                pr-number: ${{ github.event.inputs.pr-number }}
-                torch-version: ${{ github.event.inputs.torch-version || '2.13.0' }}
-                devpi-url: ${{ vars.DEVPI_URL }}
-                pip-trusted-host: ${{ vars.PIP_TRUSTED_HOST }}
-                install-compiler: 'true'
+              shell: bash
+              env:
+                PR_NUMBER: ${{ github.event.inputs.pr-number }}
+                TORCH_VERSION: ${{ github.event.inputs.torch-version || '2.13.0' }}
+                DEVPI_URL: ${{ vars.DEVPI_URL }}
+                PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}
+                INSTALL_COMPILER: 'true'
+                GH_TOKEN: ${{ github.token }}
+              run: bash .github/scripts/setup_hcu.sh
 
             - name: Build wheel
               shell: bash
@@ -134,15 +136,17 @@ jobs:
                 persist-credentials: true
 
             - name: Setup HCU environment
-              uses: ./.github/actions/setup-hcu
-              with:
-                pr-number: ${{ github.event.inputs.pr-number }}
-                torch-version: ${{ github.event.inputs.torch-version || '2.13.0' }}
-                devpi-url: ${{ vars.DEVPI_URL }}
-                pip-trusted-host: ${{ vars.PIP_TRUSTED_HOST }}
+              shell: bash
+              env:
+                PR_NUMBER: ${{ github.event.inputs.pr-number }}
+                TORCH_VERSION: ${{ github.event.inputs.torch-version || '2.13.0' }}
+                DEVPI_URL: ${{ vars.DEVPI_URL }}
+                PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}
                 # Only the build job compiles operators; skipping the compiler install keeps
                 # card pods from waiting on it.
-                install-compiler: 'false'
+                INSTALL_COMPILER: 'false'
+                GH_TOKEN: ${{ github.token }}
+              run: bash .github/scripts/setup_hcu.sh
 
             - name: Download wheel
               uses: actions/download-artifact@v4
@@ -201,13 +205,15 @@ jobs:
                 persist-credentials: true
 
             - name: Setup HCU environment
-              uses: ./.github/actions/setup-hcu
-              with:
-                pr-number: ${{ github.event.inputs.pr-number }}
-                torch-version: ${{ github.event.inputs.torch-version || '2.13.0' }}
-                devpi-url: ${{ vars.DEVPI_URL }}
-                pip-trusted-host: ${{ vars.PIP_TRUSTED_HOST }}
-                install-compiler: 'false'
+              shell: bash
+              env:
+                PR_NUMBER: ${{ github.event.inputs.pr-number }}
+                TORCH_VERSION: ${{ github.event.inputs.torch-version || '2.13.0' }}
+                DEVPI_URL: ${{ vars.DEVPI_URL }}
+                PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}
+                INSTALL_COMPILER: 'false'
+                GH_TOKEN: ${{ github.token }}
+              run: bash .github/scripts/setup_hcu.sh
 
             - name: Download wheel
               uses: actions/download-artifact@v4
@@ -263,13 +269,15 @@ jobs:
                 persist-credentials: true
 
             - name: Setup HCU environment
-              uses: ./.github/actions/setup-hcu
-              with:
-                pr-number: ${{ github.event.inputs.pr-number }}
-                torch-version: ${{ github.event.inputs.torch-version || '2.13.0' }}
-                devpi-url: ${{ vars.DEVPI_URL }}
-                pip-trusted-host: ${{ vars.PIP_TRUSTED_HOST }}
-                install-compiler: 'false'
+              shell: bash
+              env:
+                PR_NUMBER: ${{ github.event.inputs.pr-number }}
+                TORCH_VERSION: ${{ github.event.inputs.torch-version || '2.13.0' }}
+                DEVPI_URL: ${{ vars.DEVPI_URL }}
+                PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}
+                INSTALL_COMPILER: 'false'
+                GH_TOKEN: ${{ github.token }}
+              run: bash .github/scripts/setup_hcu.sh
 
             - name: Download wheel
               uses: actions/download-artifact@v4
@@ -323,13 +331,15 @@ jobs:
                 persist-credentials: true
 
             - name: Setup HCU environment
-              uses: ./.github/actions/setup-hcu
-              with:
-                pr-number: ${{ github.event.inputs.pr-number }}
-                torch-version: ${{ github.event.inputs.torch-version || '2.13.0' }}
-                devpi-url: ${{ vars.DEVPI_URL }}
-                pip-trusted-host: ${{ vars.PIP_TRUSTED_HOST }}
-                install-compiler: 'false'
+              shell: bash
+              env:
+                PR_NUMBER: ${{ github.event.inputs.pr-number }}
+                TORCH_VERSION: ${{ github.event.inputs.torch-version || '2.13.0' }}
+                DEVPI_URL: ${{ vars.DEVPI_URL }}
+                PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}
+                INSTALL_COMPILER: 'false'
+                GH_TOKEN: ${{ github.token }}
+              run: bash .github/scripts/setup_hcu.sh
 
             - name: Download wheel
               uses: actions/download-artifact@v4
@@ -379,13 +389,15 @@ jobs:
                 persist-credentials: true
 
             - name: Setup HCU environment
-              uses: ./.github/actions/setup-hcu
-              with:
-                pr-number: ${{ github.event.inputs.pr-number }}
-                torch-version: ${{ github.event.inputs.torch-version || '2.13.0' }}
-                devpi-url: ${{ vars.DEVPI_URL }}
-                pip-trusted-host: ${{ vars.PIP_TRUSTED_HOST }}
-                install-compiler: 'false'
+              shell: bash
+              env:
+                PR_NUMBER: ${{ github.event.inputs.pr-number }}
+                TORCH_VERSION: ${{ github.event.inputs.torch-version || '2.13.0' }}
+                DEVPI_URL: ${{ vars.DEVPI_URL }}
+                PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}
+                INSTALL_COMPILER: 'false'
+                GH_TOKEN: ${{ github.token }}
+              run: bash .github/scripts/setup_hcu.sh
 
             - name: Download wheel
               uses: actions/download-artifact@v4

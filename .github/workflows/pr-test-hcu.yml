@@ -4,7 +4,7 @@ on:
     # Run the workflow file from the base branch so PRs cannot alter the CI definition.
     # pull_request is the event validated on the ARC pools (ARC runbook 2.14);
     # pull_request_target has never been exercised there.
-    pull_request:
+    pull_request_target:
         branches:
           - v0.19.7-dev
         types: [opened, synchronize, reopened, ready_for_review]
@@ -22,6 +22,11 @@ on:
                 description: 'transformers version to pin (keep in sync with .github/scripts/test.sh)'
                 required: false
                 default: '5.18.0'
+            image:
+                description: 'docker image'
+                required: false
+                default: ''
+
     # cron is UTC: 16:00 UTC is midnight Beijing time.
     schedule:
         - cron: '0 16 * * *'
@@ -78,7 +83,7 @@ jobs:
             # The job template injects /dev/kfd, /dev/dri/renderD* and /opt/hyhal, and the
             # arc-runners namespace rejects privileged pods. Do not add --privileged, --device,
             # --ipc=host or hostPath volumes here.
-            image: ${{ vars.IMAGE_DTK2610 }}
+            image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
         steps:
             # pull_request already checks out the merge commit; dispatch checks out the branch
             # picked in the UI and schedule the default branch. A manual pr-number merges on top.
@@ -120,7 +125,7 @@ jobs:
         runs-on: hygon-bw1100-4card
         timeout-minutes: 60
         container:
-            image: ${{ vars.IMAGE_DTK2610 }}
+            image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
         steps:
             - name: Checkout
               uses: actions/checkout@v4
@@ -187,7 +192,7 @@ jobs:
             matrix:
                 shard: ['1', '2', '3', '4']
         container:
-            image: ${{ vars.IMAGE_DTK2610 }}
+            image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
         steps:
             - name: Checkout
               uses: actions/checkout@v4
@@ -249,7 +254,7 @@ jobs:
             matrix:
                 shard: ['1', '2']
         container:
-            image: ${{ vars.IMAGE_DTK2610 }}
+            image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
         steps:
             - name: Checkout
               uses: actions/checkout@v4
@@ -309,7 +314,7 @@ jobs:
                 # No 3-card pool exists; a 4-card pod runs the 3-card bucket with one card idle.
                 bucket: ['3gpu', '4gpu']
         container:
-            image: ${{ vars.IMAGE_DTK2610 }}
+            image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
         steps:
             - name: Checkout
               uses: actions/checkout@v4
@@ -365,7 +370,7 @@ jobs:
         runs-on: hygon-bw1100-8card
         timeout-minutes: 120
         container:
-            image: ${{ vars.IMAGE_DTK2610 }}
+            image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
         steps:
             - name: Checkout
               uses: actions/checkout@v4

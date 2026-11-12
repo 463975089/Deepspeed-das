@@ -1,9 +1,11 @@
 name: PR Test (HCU)
 
 on:
-    # Run the workflow file from the base branch so PRs (including forks) cannot alter the CI definition.
-    pull_request:
-        branches: 
+    # Run the workflow file from the base branch so PRs cannot alter the CI definition.
+    # pull_request is the event validated on the ARC pools (ARC runbook 2.14);
+    # pull_request_target has never been exercised there.
+    pull_request_target:
+        branches:
           - v0.19.7-dev
         types: [opened, synchronize, reopened, ready_for_review]
     workflow_dispatch:
@@ -16,10 +18,15 @@ on:
                 description: 'Torch version to test'
                 required: false
                 default: '2.13.0'
-            dtk-pkg:
-                description: 'Path to DTK package'
+            transformers-version:
+                description: 'transformers version to pin (keep in sync with .github/scripts/test.sh)'
                 required: false
-                default: '/ArchivedFile/dtk-pkg/dtk26.10/DTK-26.10-Rocky8.6-x86_64.tar.gz'
+                default: '5.18.0'
+            image:
+                description: 'docker image'
+                required: false
+                default: ''
+
     # cron is UTC: 16:00 UTC is midnight Beijing time.
     schedule:
         - cron: '0 16 * * *'
@@ -32,20 +39,13 @@ concurrency:
   group: pr-test-hcu-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
-env:
-  PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}
-  DEVPI_URL: ${{ vars.DEVPI_URL }}
-  # PR runs have no inputs, so fall back to the defaults.
-  DTK_PKG: ${{ inputs.dtk-pkg || '/ArchivedFile/dtk-pkg/dtk26.10/DTK-26.10-Rocky8.6-x86_64.tar.gz' }}
-  TORCH_VERSION: ${{ inputs.torch-version || '2.13.0' }}
 jobs:
     # The nightly full suite takes about 6 hours, so skip it when nothing was merged that day,
     # but still run it once every 7 idle days to catch environment drift (DTK, pip packages, runner).
+    # Bookkeeping only: this runs on the CPU pool with no container, so it never waits for a card.
     decide:
         name: Decide whether to run
-        runs-on:
-            group: ci-general
-            labels: [self-hosted, ci, bw1100]
+        runs-on: hygon-cpu
         outputs:
             run: ${{ steps.check.outputs.run }}
         steps:
@@ -69,107 +69,351 @@ jobs:
                   core.info(`Last commit on ${branch}: ${lastCommit.toISOString()}, idle ${idleDays} day(s), run=${shouldRun}`);
                   core.setOutput('run', String(shouldRun));
 
-    build-and-test:
-        name: Build and Test
+    # Compiling needs no card and wants many cores, so it belongs on hygon-build instead of
+    # occupying a card pool for its whole duration.
+    build:
+        name: Build wheel
         needs: decide
         if: needs.decide.outputs.run == 'true'
-        runs-on:
-            group: ci-general
-            labels: [self-hosted, ci, bw1100]
-        # pull_request_target runs fork code on the self-hosted runner, so require a maintainer approval first.
-        timeout-minutes: 720
+        runs-on: hygon-build
+        # Compiling plus the full dependency install. The pool's own 15-minute resource wait
+        # is counted separately by the scheduler.
+        timeout-minutes: 120
         container:
-            image: ${{ vars.IMAGE_DTK2610 }}
-            volumes:
-                - /public/opendas/ArchivedFile:/ArchivedFile:ro
-                - /public5:/public5:ro
-                - /opt/hyhal/:/opt/hyhal/:ro
-            # No --privileged: the job runs fork code, and a privileged container can take over the host.
-            options: >-
-                --privileged
-                --shm-size=16g
-                --device=/dev/kfd
-                --device=/dev/dri
-                --group-add=video
-                --cap-add=SYS_PTRACE
-                --security-opt seccomp=unconfined
+            # The job template injects /dev/kfd, /dev/dri/renderD* and /opt/hyhal, and the
+            # arc-runners namespace rejects privileged pods. Do not add --privileged, --device,
+            # --ipc=host or hostPath volumes here.
+            image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
         steps:
-            # PR runs test against the latest base branch; manual runs use the branch picked in the UI.
-            - name: Checkout base branch
+            # pull_request already checks out the merge commit; dispatch checks out the branch
+            # picked in the UI and schedule the default branch. A manual pr-number merges on top.
+            - name: Checkout
               uses: actions/checkout@v4
               with:
-                ref: ${{ github.event.pull_request.base.ref || github.ref }}
                 fetch-depth: 0
-                # Keep the token out of .git/config so PR code cannot read it.
                 persist-credentials: true
 
-            # ${{ github.workspace }} resolves to the host path in container jobs, so derive it inside the container.
-            - name: Set reports directory
-              run: echo "REPORTS_DIR=${GITHUB_WORKSPACE}/reports" >> "$GITHUB_ENV"
+            - name: Setup HCU environment
+              uses: ./.github/actions/setup-hcu
+              with:
+                pr-number: ${{ github.event.inputs.pr-number }}
+                torch-version: ${{ github.event.inputs.torch-version || '2.13.0' }}
+                devpi-url: ${{ vars.DEVPI_URL }}
+                pip-trusted-host: ${{ vars.PIP_TRUSTED_HOST }}
+                install-compiler: 'true'
 
-            - name: Merge PR into base
-              if: github.event_name == 'pull_request_target' || inputs.pr-number != ''
-              env:
-                # Pass via env instead of inline ${{ }} so a manual input cannot inject shell commands.
-                PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr-number }}
-                # The repo is private, so the fetch needs a token; pass it only to this one command so it never lands in .git/config.
-                GH_TOKEN: ${{ github.token }}
-              run: |
-                git config user.name "github-actions[bot]"
-                git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-                auth=$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)
-                git -c http.extraheader="AUTHORIZATION: basic ${auth}" \
-                    fetch "https://github.com/${GITHUB_REPOSITORY}.git" "pull/${PR_NUMBER}/head:pr"
-                git merge --no-ff --no-edit pr
-
-            - name: install dtk and aicc
+            - name: Build wheel
               shell: bash
+              run: bash .github/scripts/compile.sh
+
+            # Each test job runs in its own container with no shared state, so the wheel has
+            # to travel as an artifact.
+            - name: Upload wheel
+              uses: actions/upload-artifact@v4
+              with:
+                name: deepspeed-wheel
+                path: dist/*.whl
+                retention-days: 1
+
+    # PR validation runs the smoke subset only: the full suite takes hours and belongs to
+    # the nightly. run_test_smoke.sh includes unit/comm/test_dist.py::TestInit, whose
+    # world_size is 3, so it needs the 4-card pool (the smallest one with at least 3 cards).
+    smoke:
+        name: Smoke (4 card)
+        needs: [decide, build]
+        if: needs.decide.outputs.run == 'true' && github.event_name == 'pull_request'
+        runs-on: hygon-bw1100-4card
+        timeout-minutes: 60
+        container:
+            image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+              with:
+                fetch-depth: 0
+                persist-credentials: true
+
+            - name: Setup HCU environment
+              uses: ./.github/actions/setup-hcu
+              with:
+                pr-number: ${{ github.event.inputs.pr-number }}
+                torch-version: ${{ github.event.inputs.torch-version || '2.13.0' }}
+                devpi-url: ${{ vars.DEVPI_URL }}
+                pip-trusted-host: ${{ vars.PIP_TRUSTED_HOST }}
+                # Only the build job compiles operators; skipping the compiler install keeps
+                # card pods from waiting on it.
+                install-compiler: 'false'
+
+            - name: Download wheel
+              uses: actions/download-artifact@v4
+              with:
+                name: deepspeed-wheel
+                path: dist
+
+            # Test jobs need the Python dependencies but must not rebuild the operators.
+            # compile.sh installs an unpinned transformers, so pin it back to the version the
+            # suite is validated against; results are not comparable across arbitrary releases.
+            - name: Install dependencies and wheel
+              shell: bash
+              env:
+                TRANSFORMERS_VERSION: ${{ github.event.inputs.transformers-version || '5.18.0' }}
               run: |
                 set -eu
-                yum install -y libaio-devel
-                yum install -y libaio
-                bash .github/scripts/hcu_llvm_installer.sh
-    
-            - name: install pytorch
+                source /opt/dtk/env.sh
+                bash .github/scripts/compile.sh --deps-only
+                pip install "transformers==${TRANSFORMERS_VERSION}"
+                pip install dist/*.whl
+
+            - name: Run smoke tests
               shell: bash
               run: |
                 source /opt/dtk/env.sh
-                mkdir -p ~/.pip
-                cat > ~/.pip/pip.conf << EOF
-                [global]
-                    index-url = ${DEVPI_URL}/nightly/dtk2610/+simple/
-                    trusted-host = ${PIP_TRUSTED_HOST}
-                EOF
-                pip install torch==${TORCH_VERSION}
-                bash .github/scripts/install_with_torch.sh torchvision ${TORCH_VERSION}
-                bash .github/scripts/install_with_torch.sh triton ${TORCH_VERSION}
-                bash .github/scripts/install_with_torch.sh apex ${TORCH_VERSION}
-                bash .github/scripts/install_with_torch.sh flash_attn ${TORCH_VERSION}
-                
-            
-            - name: build whl
+                bash tests/run_test_smoke.sh
+
+    # Full suite, split by card count. run_test_<N>gpu.sh holds exactly the targets whose
+    # maximum world_size is N, and the 1-GPU/2-GPU buckets are further split into shard
+    # scripts that matrix runs in parallel (the split lives in tests/gen_run_test_buckets.py;
+    # keep both sides in sync). Shard counts stay within each pool's maxRunners: extra
+    # shards would only queue.
+    #   1card  197 targets, maxRunners 8 -> 4 shards
+    #   2card   62 targets, maxRunners 2 -> 2 shards
+    #   4card   26 targets, maxRunners 2 -> one job per bucket script
+    #   8card    5 targets, maxRunners 1 -> one job
+    test-1card:
+        name: Test (1 card, ${{ matrix.shard }})
+        needs: [decide, build]
+        if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request'
+        runs-on: hygon-bw1100-1card
+        timeout-minutes: 120
+        strategy:
+            # A failing shard must not cancel its siblings: the point of splitting is that
+            # every target still reports a result.
+            fail-fast: false
+            matrix:
+                shard: ['1', '2', '3', '4']
+        container:
+            image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+              with:
+                fetch-depth: 0
+                persist-credentials: true
+
+            - name: Setup HCU environment
+              uses: ./.github/actions/setup-hcu
+              with:
+                pr-number: ${{ github.event.inputs.pr-number }}
+                torch-version: ${{ github.event.inputs.torch-version || '2.13.0' }}
+                devpi-url: ${{ vars.DEVPI_URL }}
+                pip-trusted-host: ${{ vars.PIP_TRUSTED_HOST }}
+                install-compiler: 'false'
+
+            - name: Download wheel
+              uses: actions/download-artifact@v4
+              with:
+                name: deepspeed-wheel
+                path: dist
+
+            - name: Install dependencies and wheel
+              shell: bash
+              env:
+                TRANSFORMERS_VERSION: ${{ github.event.inputs.transformers-version || '5.18.0' }}
+              run: |
+                set -eu
+                source /opt/dtk/env.sh
+                bash .github/scripts/compile.sh --deps-only
+                pip install "transformers==${TRANSFORMERS_VERSION}"
+                pip install dist/*.whl
+
+            - name: Run tests
               shell: bash
               run: |
-                bash .github/scripts/compile.sh
-            
-            # The full suite takes about 6 hours, so it runs nightly or on demand rather than on every PR.
-            - name: run full tests
-              if: github.event_name != 'pull_request_target'
-              shell: bash
-              # test.sh sets up the DTK env itself and must keep going after a failing test, so no `set -e` here.
-              run: bash .github/scripts/test.sh
+                source /opt/dtk/env.sh
+                bash tests/run_test_1gpu_${{ matrix.shard }}.sh
 
-            - name: run pr tests
-              if: github.event_name == 'pull_request_target'
+            # The bucket scripts skip themselves when the pod has fewer cards than they
+            # need, and exit non-zero if any of their targets failed.
+            - name: Upload test reports
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                # upload-artifact v4 requires a unique name per job.
+                name: hcu-test-reports-1card-shard${{ matrix.shard }}-${{ github.run_id }}
+                path: ${{ env.REPORTS_DIR }}
+                if-no-files-found: ignore
+
+    test-2card:
+        name: Test (2 card, ${{ matrix.shard }})
+        needs: [decide, build]
+        if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request'
+        runs-on: hygon-bw1100-2card
+        timeout-minutes: 90
+        strategy:
+            fail-fast: false
+            matrix:
+                shard: ['1', '2']
+        container:
+            image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+              with:
+                fetch-depth: 0
+                persist-credentials: true
+
+            - name: Setup HCU environment
+              uses: ./.github/actions/setup-hcu
+              with:
+                pr-number: ${{ github.event.inputs.pr-number }}
+                torch-version: ${{ github.event.inputs.torch-version || '2.13.0' }}
+                devpi-url: ${{ vars.DEVPI_URL }}
+                pip-trusted-host: ${{ vars.PIP_TRUSTED_HOST }}
+                install-compiler: 'false'
+
+            - name: Download wheel
+              uses: actions/download-artifact@v4
+              with:
+                name: deepspeed-wheel
+                path: dist
+
+            - name: Install dependencies and wheel
               shell: bash
-              run:  |
-                  source /opt/dtk/env.sh
-                  export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-                  bash tests/run_test_smoke.sh
+              env:
+                TRANSFORMERS_VERSION: ${{ github.event.inputs.transformers-version || '5.18.0' }}
+              run: |
+                set -eu
+                source /opt/dtk/env.sh
+                bash .github/scripts/compile.sh --deps-only
+                pip install "transformers==${TRANSFORMERS_VERSION}"
+                pip install dist/*.whl
+
+            - name: Run tests
+              shell: bash
+              run: |
+                source /opt/dtk/env.sh
+                bash tests/run_test_2gpu_${{ matrix.shard }}.sh
 
             - name: Upload test reports
               if: always()
               uses: actions/upload-artifact@v4
               with:
-                name: hcu-test-reports-${{ github.run_id }}
+                name: hcu-test-reports-2card-shard${{ matrix.shard }}-${{ github.run_id }}
                 path: ${{ env.REPORTS_DIR }}
+                if-no-files-found: ignore
+
+    test-4card:
+        name: Test (3-4 card, ${{ matrix.bucket }})
+        needs: [decide, build]
+        if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request'
+        runs-on: hygon-bw1100-4card
+        timeout-minutes: 90
+        strategy:
+            fail-fast: false
+            matrix:
+                # No 3-card pool exists; a 4-card pod runs the 3-card bucket with one card idle.
+                bucket: ['3gpu', '4gpu']
+        container:
+            image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+              with:
+                fetch-depth: 0
+                persist-credentials: true
+
+            - name: Setup HCU environment
+              uses: ./.github/actions/setup-hcu
+              with:
+                pr-number: ${{ github.event.inputs.pr-number }}
+                torch-version: ${{ github.event.inputs.torch-version || '2.13.0' }}
+                devpi-url: ${{ vars.DEVPI_URL }}
+                pip-trusted-host: ${{ vars.PIP_TRUSTED_HOST }}
+                install-compiler: 'false'
+
+            - name: Download wheel
+              uses: actions/download-artifact@v4
+              with:
+                name: deepspeed-wheel
+                path: dist
+
+            - name: Install dependencies and wheel
+              shell: bash
+              env:
+                TRANSFORMERS_VERSION: ${{ github.event.inputs.transformers-version || '5.18.0' }}
+              run: |
+                set -eu
+                source /opt/dtk/env.sh
+                bash .github/scripts/compile.sh --deps-only
+                pip install "transformers==${TRANSFORMERS_VERSION}"
+                pip install dist/*.whl
+
+            - name: Run tests
+              shell: bash
+              run: |
+                source /opt/dtk/env.sh
+                bash tests/run_test_${{ matrix.bucket }}.sh
+
+            - name: Upload test reports
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                name: hcu-test-reports-${{ matrix.bucket }}-${{ github.run_id }}
+                path: ${{ env.REPORTS_DIR }}
+                if-no-files-found: ignore
+
+    # The 8-card pool caps at a single Runner, so its targets run one after another.
+    test-8card:
+        name: Test (8 card)
+        needs: [decide, build]
+        if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request'
+        runs-on: hygon-bw1100-8card
+        timeout-minutes: 120
+        container:
+            image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+              with:
+                fetch-depth: 0
+                persist-credentials: true
+
+            - name: Setup HCU environment
+              uses: ./.github/actions/setup-hcu
+              with:
+                pr-number: ${{ github.event.inputs.pr-number }}
+                torch-version: ${{ github.event.inputs.torch-version || '2.13.0' }}
+                devpi-url: ${{ vars.DEVPI_URL }}
+                pip-trusted-host: ${{ vars.PIP_TRUSTED_HOST }}
+                install-compiler: 'false'
+
+            - name: Download wheel
+              uses: actions/download-artifact@v4
+              with:
+                name: deepspeed-wheel
+                path: dist
+
+            - name: Install dependencies and wheel
+              shell: bash
+              env:
+                TRANSFORMERS_VERSION: ${{ github.event.inputs.transformers-version || '5.18.0' }}
+              run: |
+                set -eu
+                source /opt/dtk/env.sh
+                bash .github/scripts/compile.sh --deps-only
+                pip install "transformers==${TRANSFORMERS_VERSION}"
+                pip install dist/*.whl
+
+            - name: Run tests
+              shell: bash
+              run: |
+                source /opt/dtk/env.sh
+                bash tests/run_test_8gpu.sh
+
+            - name: Upload test reports
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                name: hcu-test-reports-8card-${{ github.run_id }}
+                path: ${{ env.REPORTS_DIR }}
+                if-no-files-found: ignore

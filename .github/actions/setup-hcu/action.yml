@@ -1,0 +1,92 @@
+name: Setup HCU environment
+description: |
+  Merge the PR under test and install the PyTorch stack in the job container.
+  Every job that runs repository code needs this, because each ARC job gets a
+  fresh container with no persisted state.
+
+inputs:
+  pr-number:
+    description: 'PR number to merge into the checked-out base branch; empty tests the branch as-is.'
+    required: false
+    default: ''
+  torch-version:
+    description: 'Torch version to install.'
+    required: true
+  devpi-url:
+    description: 'Devpi index that serves the torch wheels.'
+    required: true
+  pip-trusted-host:
+    description: 'Trusted host for the devpi index.'
+    required: true
+  install-compiler:
+    description: |
+      Install the AICC compiler. Only the build job compiles C++ operators, so
+      the test jobs skip it to keep their startup short.
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    # Manual runs may ask to validate an open PR; PR runs already checked out the
+    # base branch and must merge the head on top of it.
+    - name: Merge PR into base
+      if: inputs.pr-number != ''
+      shell: bash
+      env:
+        PR_NUMBER: ${{ inputs.pr-number }}
+        # The repo is private, so the fetch needs a token. Pass it only to this
+        # command so it never lands in .git/config.
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -eu
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        auth=$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 -w0)
+        git -c http.extraheader="AUTHORIZATION: basic ${auth}" \
+            fetch "https://github.com/${GITHUB_REPOSITORY}.git" "pull/${PR_NUMBER}/head:pr"
+        git merge --no-ff --no-edit pr
+
+    - name: Configure pip
+      shell: bash
+      env:
+        DEVPI_URL: ${{ inputs.devpi-url }}
+        PIP_TRUSTED_HOST: ${{ inputs.pip-trusted-host }}
+      run: |
+        set -eu
+        mkdir -p ~/.pip
+        cat > ~/.pip/pip.conf << EOF
+        [global]
+            index-url = ${DEVPI_URL}/nightly/dtk2610/+simple/
+            trusted-host = ${PIP_TRUSTED_HOST}
+        EOF
+
+    # Required at runtime by the compiled operator libraries, not only at build time,
+    # so every job installs it.
+    - name: Install system libraries
+      shell: bash
+      run: yum install -y libaio-devel libaio
+
+    - name: Install HCU compiler
+      if: inputs.install-compiler == 'true'
+      shell: bash
+      run: bash .github/scripts/hcu_llvm_installer.sh
+
+    - name: Install PyTorch
+      shell: bash
+      env:
+        TORCH_VERSION: ${{ inputs.torch-version }}
+      run: |
+        set -eu
+        source /opt/dtk/env.sh
+        pip install torch==${TORCH_VERSION}
+        bash .github/scripts/install_with_torch.sh torchvision ${TORCH_VERSION}
+        bash .github/scripts/install_with_torch.sh triton ${TORCH_VERSION}
+        bash .github/scripts/install_with_torch.sh apex ${TORCH_VERSION}
+        bash .github/scripts/install_with_torch.sh flash_attn ${TORCH_VERSION}
+
+    # ${{ github.workspace }} resolves to the host path inside a container job,
+    # so derive the reports directory from the container's own filesystem.
+    - name: Set reports directory
+      shell: bash
+      run: echo "REPORTS_DIR=${GITHUB_WORKSPACE}/reports" >> "$GITHUB_ENV"

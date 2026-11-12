@@ -77,6 +77,14 @@ check_dtk
 #check_aicc
 install_dependencies
 
+# Test jobs run in their own fresh container but do not compile anything, so they
+# need the same dependencies without paying for the build. Keeping one entry point
+# stops the two lists from drifting apart.
+if [ "${1:-}" = "--deps-only" ]; then
+    echo "Dependencies installed; skipping the build (--deps-only)."
+    exit 0
+fi
+
 export BUILD_ROOT=${GITHUB_WORKSPACE}
 export PYTHON_VERSION=$(python --version 2>&1 | awk -F '[ .]' '{print $2 "." $3}')
 export LD_LIBRARY_PATH=/usr/local/lib/python${PYTHON_VERSION}/site-packages/torch/lib:$BUILD_ROOT/third_party/libaio_build/lib:$LD_LIBRARY_PATH

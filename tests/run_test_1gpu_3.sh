@@ -9,8 +9,8 @@
 # The shards of one bucket are disjoint; the CI matrix runs them in
 # parallel and together they cover every target exactly once.
 #
-# transformers: no target here asserts a floor; any release that satisfies
-# requirements/requirements-dev.txt (>= 4.51.3) is enough.
+# transformers floor for this shard: >= 5.3.0
+#   >= 5.3.0  unit/inference/v2/model_implementations/test_exaone4_5.py
 #
 # Class-gated (these skip themselves if the installed transformers lacks
 # the model class they probe):
@@ -128,7 +128,6 @@ cd "${TESTS_DIR}"
 
 FAILURES=0
 
-record pytest --timeout=1400 ./unit/v1/moe/test_fused_expert_layout.py
 record pytest --timeout=1400 ./unit/v1/multimodal/test_gemma4_config.py
 record pytest --timeout=1400 ./unit/v1/zero/test_overlap_comm_record_stream.py
 record pytest --timeout=1400 ./unit/v1/zero/test_zero2_offload_multi_backward.py
@@ -177,5 +176,7 @@ record pytest --timeout=1400 ./unit/compile/test_backend.py
 record pytest --timeout=1400 ./unit/compile/test_pass_contract.py
 record pytest --timeout=1400 ./unit/hybrid_engine/test_he_cuda_graph.py
 record pytest --timeout=1400 ./unit/hybrid_engine/test_he_policy.py
+# transformers >= 5.3.0
+record pytest --timeout=1400 ./unit/inference/v2/model_implementations/test_exaone4_5.py
 
 exit_with_summary "1-GPU bucket, shard 3 of 4"

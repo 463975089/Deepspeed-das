@@ -4,8 +4,15 @@
 
 set -euo pipefail
 
-# 生成 manylinux 版本标识
+# The glibc of the build image decides the tag (rocky 8.6 -> manylinux_2_28).
+# The repaired wheel keeps that tag: pip then refuses the install on machines
+# with older glibc instead of failing later at import time with a missing
+# symbol. No tail-stage retagging happens, so auditwheel's work is the product.
 PLATFORM="manylinux_$(ldd --version | awk '{print $NF}' | head -n1 | tr '.' '_')_x86_64"
+
+# The image does not necessarily ship auditwheel; setup_hcu.sh already pointed
+# pip at the devpi index, which serves it.
+pip install auditwheel
 
 TORCH_PATH=$(python -c "import torch, os; print(os.path.dirname(torch.__file__))" 2>/dev/null)
 export LD_LIBRARY_PATH="${TORCH_PATH}/lib:${LD_LIBRARY_PATH}"
@@ -45,15 +52,12 @@ auditwheel repair --plat "${PLATFORM}" --strip \
   -w dist/ \
   dist/*.whl
 
-cd dist/
-pack=`ls |grep manylinux_2_27`
-wheel unpack ${pack}
-base=$(ls -t|head -n 1)
-cd ${base}
-dir=`ls |grep info`
-sed -i '/manylinux_2_27/d' ${dir}/WHEEL
-cd ../
-wheel pack ${base}
-rm -rf ${base}
-rm -rf ${pack}
-cd ..
+# auditwheel leaves the input wheel next to the repaired one. The deliverable
+# keeps its manylinux tag, so the raw linux_x86_64 build has to go away or
+# CIUpload and the wheel artifact would both receive two files.
+for wheel in dist/*.whl; do
+    case "${wheel}" in
+        *manylinux*) ;;
+        *) rm -f "${wheel}" ;;
+    esac
+done

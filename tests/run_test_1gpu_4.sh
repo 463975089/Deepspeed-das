@@ -9,8 +9,8 @@
 # The shards of one bucket are disjoint; the CI matrix runs them in
 # parallel and together they cover every target exactly once.
 #
-# transformers floor for this shard: >= 5.3.0
-#   >= 5.3.0  unit/inference/v2/model_implementations/test_exaone4_5.py
+# transformers: no target here asserts a floor; any release that satisfies
+# requirements/requirements-dev.txt (>= 4.51.3) is enough.
 #
 # Class-gated (these skip themselves if the installed transformers lacks
 # the model class they probe):
@@ -128,8 +128,6 @@ cd "${TESTS_DIR}"
 
 FAILURES=0
 
-# transformers >= 5.3.0
-record pytest --timeout=1400 ./unit/inference/v2/model_implementations/test_exaone4_5.py
 record pytest --timeout=1400 ./unit/inference/v2/model_implementations/test_rope_theta.py
 record pytest --timeout=1400 ./unit/module_inject/test_auto_ep_comm.py
 record pytest --timeout=1400 ./unit/module_inject/test_fused_repartition.py

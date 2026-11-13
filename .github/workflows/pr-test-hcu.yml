@@ -128,6 +128,9 @@ jobs:
         timeout-minutes: 60
         container:
             image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
+        env:
+            HIP_VISIBLE_DEVICES: 0,1,2,3
+            CUDA_VISIBLE_DEVICES: 0,1,2,3
         steps:
             - name: Checkout
               uses: actions/checkout@v4
@@ -142,9 +145,9 @@ jobs:
                 TORCH_VERSION: ${{ github.event.inputs.torch-version || '2.13.0' }}
                 DEVPI_URL: ${{ vars.DEVPI_URL }}
                 PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}
-                # Only the build job compiles operators; skipping the compiler install keeps
-                # card pods from waiting on it.
-                INSTALL_COMPILER: 'false'
+                # Triton compiles HSACO at test time, so every card job needs the toolchain,
+                # not just the build job.
+                INSTALL_COMPILER: 'true'
                 GH_TOKEN: ${{ github.token }}
               run: bash .github/scripts/setup_hcu.sh
 
@@ -188,7 +191,7 @@ jobs:
         needs: [decide, build]
         if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request'
         runs-on: hygon-bw1100-1card
-        timeout-minutes: 120
+        timeout-minutes: 360
         strategy:
             # A failing shard must not cancel its siblings: the point of splitting is that
             # every target still reports a result.
@@ -197,6 +200,9 @@ jobs:
                 shard: ['1', '2', '3', '4']
         container:
             image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
+        env:
+            HIP_VISIBLE_DEVICES: 0
+            CUDA_VISIBLE_DEVICES: 0
         steps:
             - name: Checkout
               uses: actions/checkout@v4
@@ -211,7 +217,7 @@ jobs:
                 TORCH_VERSION: ${{ github.event.inputs.torch-version || '2.13.0' }}
                 DEVPI_URL: ${{ vars.DEVPI_URL }}
                 PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}
-                INSTALL_COMPILER: 'false'
+                INSTALL_COMPILER: 'true'
                 GH_TOKEN: ${{ github.token }}
               run: bash .github/scripts/setup_hcu.sh
 
@@ -238,6 +244,19 @@ jobs:
                 source /opt/dtk/env.sh
                 bash tests/run_test_1gpu_${{ matrix.shard }}.sh
 
+            # test_model_profiling uses the pipeline framework= switch, which transformers
+            # 5.x removed, so the main suite cannot run it with the pinned release. A
+            # dedicated step installs the newest 4.x for just this test; the version swap
+            # dies with the job and never touches the rest of the shard.
+            - name: Run inference test on legacy transformers
+              if: matrix.shard == '2'
+              shell: bash
+              run: |
+                source /opt/dtk/env.sh
+                pip install "transformers~=4.57.0"
+                cd tests
+                pytest --timeout=1400 ./unit/inference/test_model_profiling.py                     --junitxml="${REPORTS_DIR}/legacy-inference.xml"
+
             # The bucket scripts skip themselves when the pod has fewer cards than they
             # need, and exit non-zero if any of their targets failed.
             - name: Upload test reports
@@ -254,13 +273,16 @@ jobs:
         needs: [decide, build]
         if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request'
         runs-on: hygon-bw1100-2card
-        timeout-minutes: 90
+        timeout-minutes: 360
         strategy:
             fail-fast: false
             matrix:
                 shard: ['1', '2']
         container:
             image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
+        env:
+            HIP_VISIBLE_DEVICES: 0,1
+            CUDA_VISIBLE_DEVICES: 0,1
         steps:
             - name: Checkout
               uses: actions/checkout@v4
@@ -275,7 +297,7 @@ jobs:
                 TORCH_VERSION: ${{ github.event.inputs.torch-version || '2.13.0' }}
                 DEVPI_URL: ${{ vars.DEVPI_URL }}
                 PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}
-                INSTALL_COMPILER: 'false'
+                INSTALL_COMPILER: 'true'
                 GH_TOKEN: ${{ github.token }}
               run: bash .github/scripts/setup_hcu.sh
 
@@ -315,7 +337,7 @@ jobs:
         needs: [decide, build]
         if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request'
         runs-on: hygon-bw1100-4card
-        timeout-minutes: 90
+        timeout-minutes: 360
         strategy:
             fail-fast: false
             matrix:
@@ -323,6 +345,9 @@ jobs:
                 bucket: ['3gpu', '4gpu']
         container:
             image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
+        env:
+            HIP_VISIBLE_DEVICES: 0,1,2,3
+            CUDA_VISIBLE_DEVICES: 0,1,2,3
         steps:
             - name: Checkout
               uses: actions/checkout@v4
@@ -337,7 +362,7 @@ jobs:
                 TORCH_VERSION: ${{ github.event.inputs.torch-version || '2.13.0' }}
                 DEVPI_URL: ${{ vars.DEVPI_URL }}
                 PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}
-                INSTALL_COMPILER: 'false'
+                INSTALL_COMPILER: 'true'
                 GH_TOKEN: ${{ github.token }}
               run: bash .github/scripts/setup_hcu.sh
 
@@ -378,9 +403,12 @@ jobs:
         needs: [decide, build]
         if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request'
         runs-on: hygon-bw1100-8card
-        timeout-minutes: 120
+        timeout-minutes: 360
         container:
             image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
+        env:
+            HIP_VISIBLE_DEVICES: 0,1,2,3,4,5,6,7
+            CUDA_VISIBLE_DEVICES: 0,1,2,3,4,5,6,7
         steps:
             - name: Checkout
               uses: actions/checkout@v4
@@ -395,7 +423,7 @@ jobs:
                 TORCH_VERSION: ${{ github.event.inputs.torch-version || '2.13.0' }}
                 DEVPI_URL: ${{ vars.DEVPI_URL }}
                 PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}
-                INSTALL_COMPILER: 'false'
+                INSTALL_COMPILER: 'true'
                 GH_TOKEN: ${{ github.token }}
               run: bash .github/scripts/setup_hcu.sh
 

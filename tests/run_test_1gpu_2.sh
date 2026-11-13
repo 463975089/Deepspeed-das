@@ -146,7 +146,6 @@ record pytest --timeout=1400 ./unit/ops/transformer/inference/test_rope.py
 record pytest --timeout=1400 ./unit/hybrid_engine/test_he_all.py
 record pytest --timeout=1400 ./unit/hybrid_engine/test_he_lora.py
 record pytest --timeout=1400 ./unit/hybrid_engine/test_he_llama.py
-record pytest -m inference --timeout=1400 ./unit/inference/test_model_profiling.py
 record pytest --timeout=1400 ./unit/inference/v2/kernels/core_ops/test_pre_ln.py
 record pytest --timeout=1400 ./unit/inference/v2/kernels/core_ops/test_post_ln.py
 record pytest --timeout=1400 ./unit/inference/v2/kernels/core_ops/test_blas_linear.py
@@ -178,5 +177,6 @@ record pytest --timeout=1400 ./unit/v1/compile/test_selective_gather.py
 record pytest --timeout=1400 ./unit/v1/half_precision/test_mixed_precision_dtype.py
 # transformers >= 5.0.0
 record pytest --timeout=1400 ./unit/v1/moe/test_autoep_unit.py
+record pytest --timeout=1400 ./unit/v1/moe/test_fused_expert_layout.py
 
 exit_with_summary "1-GPU bucket, shard 2 of 4"

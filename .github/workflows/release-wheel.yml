@@ -1,21 +1,24 @@
 name: Nightly Wheel
 
-# main 线双 dist：一次构建出 sgl-kernel + hcu-adapter 两张纯 python wheel，
-# 版本在构建期打成 +hcu.<时间>.g<commit6>，adapter 元数据精确互锁同戳内核，
-# 产物即最终包（不走 CIUpload REPAIR / 上传后改写）。
-# push main 直接上传 nightly 归档；workflow_dispatch 只构建并保留 artifact。
 
 on:
   push:
     branches:
-      - main
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: '要构建的 Git ref/branch/tag/SHA，默认当前分支 HEAD'
-        required: false
-        default: ''
-        type: string
+      - v0.19.7-dev
+    workflow_dispatch:
+        inputs:     
+            torch-version:
+                description: 'Torch version to test'
+                required: false
+                default: '2.13.0'
+            image:
+                description: 'docker image'
+                required: false
+                default: ''
+            dtk_tag:
+                description: 'dtk tag'
+                required: false
+                default: ''
 
 permissions:
   contents: read
@@ -37,30 +40,47 @@ jobs:
     defaults:
       run:
         shell: bash
-    # 纯 python 构建，不依赖 DTK/GPU；任何带 python>=3.9 + pip 的镜像都能编，
-    # 这里只用内网 registry 里现成的镜像固定工具链，换镜像不影响产物。
+    # 编译只占 CPU 不占卡,但算子要链接 DTK 和 torch,镜像必须带 DTK 工具链;
+    # 镜像的 glibc 还决定 repair 给 wheel 打的 manylinux 标签。
     container:
-      image: ${{ vars.HARBOR_SITE }}/hcu/base/dtk:26.10-ubuntu22.04-py3.12
+      image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
 
     env:
       PYPI_URL: ${{ vars.PYPI_URL }}
-      # wheel 是纯 python，不按 DTK/torch/python 分版本；这个 token 只决定
-      # 上传到 nightly 归档的哪个目录（das_nightly/dtk<DTK_VER>）。
-      DTK_VER: '2610'
+      # 算子烧进 wheel(compile.sh 用 DS_BUILD_OPS=1),产物绑定 torch 版本;
+      # DTK_VER 只决定归档到 nightly 的哪个目录(das_nightly/dtk<DTK_VER>)。
+      DTK_VER: ${{ github.event.inputs.dtk_tag || '2610' }}
+      # 必须是 job 级:repair 步骤的 CIUpload --torch_version 也要用它,
+      # 而 Setup HCU 步骤里的 step env 跨不了 step。
+      TORCH_VERSION: ${{ github.event.inputs.torch-version || '2.13.0' }}
 
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ github.sha }}
 
-      # 戳由 build.sh 自己算（<时间>.g<commit6>）并在同一次运行里烙进两张 wheel；
-      # 构建后端（setuptools/wheel）缺失时 build.sh 会自己补装
+      - name: Setup HCU environment
+        env:
+            DEVPI_URL: ${{ vars.DEVPI_URL }}
+            PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}
+            INSTALL_COMPILER: 'true'
+            GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/setup_hcu.sh
 
-      - name: Build stamped wheels
+      - name: Build wheel
+        run: bash .github/scripts/compile.sh
+
+      - name: repair wheel
         run: |
-          bash packaging/build.sh
-          echo "=== wheels ==="
-          ls -lh dist/*.whl
+          bash .github/scripts/repair_manylinux.sh
+          pip install ciupload -i https://pypi.sourcefind.cn/release/dtk/
+          mkdir -p repair
+          LOCAL_VER="$(git rev-parse --short=6 HEAD)"
+          CIUpload REPAIR --dtk_version ${DTK_VER} \
+          --torch_version ${TORCH_VERSION} \
+          --git_commit ${LOCAL_VER} \
+          --outputdir repair \
+          -f dist/*.whl
 
       - name: Upload nightly
         env:
@@ -68,13 +88,12 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           if [[ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]]; then
-            pip install --no-cache-dir ciupload -i https://pypi.sourcefind.cn/release/dtk/
             CIUpload NIGHTLY \
               --devpi_url "${PYPI_URL}" \
               --password "${CIUPLOAD_PASSWORD}" \
               --dtk_version "${DTK_VER}" \
               --record \
-              -f dist/*.whl
+              -f repair/*.whl
           fi
 
       - name: Upload wheels

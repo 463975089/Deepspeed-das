@@ -54,6 +54,14 @@ BROKEN_TRANSFORMERS_RANGES = [("5.8.0", "5.10.1")]
 # Buckets absent from this map stay in a single file.
 SPLIT_COUNTS = {1: 4, 2: 2}
 
+# Targets that need a transformers release older than the suite's pin because they
+# use an API that transformers 5.x removed. They stay in run_test.sh (the single
+# source of truth) but are excluded from the generated bucket scripts; the CI
+# workflow runs them in a dedicated step after installing the version they need.
+LEGACY_TRANSFORMERS_TARGETS = {
+    "unit/inference/test_model_profiling.py",
+}
+
 
 def in_broken_range(version):
     if version is None:
@@ -539,6 +547,8 @@ def write_all(scripts):
 
 def main():
     targets, disabled = parse_run_test(RUN_TEST)
+    legacy = [t["rel"] for t in targets if t["rel"] in LEGACY_TRANSFORMERS_TARGETS]
+    targets = [t for t in targets if t["rel"] not in LEGACY_TRANSFORMERS_TARGETS]
     buckets, meta = assign(targets)
 
     scripts = []
@@ -553,6 +563,8 @@ def main():
 
     total = sum(len(v) for v in buckets.values())
     print("active targets: %d (plus %d disabled kept for parity)" % (total, len(disabled)))
+    if legacy:
+        print("  (%d target(s) needing an older transformers release run in a dedicated CI step)" % len(legacy))
     for _, name in scripts:
         print("  %-22s %d targets" % (name, counts[name]))
     print("  run_test_all.sh")

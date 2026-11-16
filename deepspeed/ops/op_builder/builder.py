@@ -312,7 +312,7 @@ class OpBuilder(ABC):
             rocm_gpu_arch = match.group(0).strip() if match else ""
         except subprocess.CalledProcessError:
             rocm_gpu_arch = ""
-        OpBuilder._rocm_gpu_arch = "gfx928,gfx936,gfx938"
+        OpBuilder._rocm_gpu_arch = "gfx928,gfx936,gfx938,gfx946"
         return OpBuilder._rocm_gpu_arch
 
     @staticmethod
@@ -912,7 +912,7 @@ class CUDAOpBuilder(OpBuilder):
                 '-std=c++17', '-U__HIP_NO_HALF_OPERATORS__', '-U__HIP_NO_HALF_CONVERSIONS__',
                 '-U__HIP_NO_HALF2_OPERATORS__',
                 '-DROCM_VERSION_MAJOR=%s' % ROCM_MAJOR,
-                '-DROCM_VERSION_MINOR=%s' % ROCM_MINOR, '--offload-arch=gfx936,gfx928,gfx938'
+                '-DROCM_VERSION_MINOR=%s' % ROCM_MINOR, '--offload-arch=gfx936,gfx928,gfx938,gfx946'
             ]
             self.enable_bf16 = True
         else:

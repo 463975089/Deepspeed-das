@@ -13,6 +13,12 @@ PLATFORM="manylinux_$(ldd --version | awk '{print $NF}' | head -n1 | tr '.' '_')
 # The image does not necessarily ship auditwheel; setup_hcu.sh already pointed
 # pip at the devpi index, which serves it.
 pip install auditwheel
+# auditwheel repair hard-requires patchelf >= 0.14.5 and the image carries
+# 0.12. The PyPI package ships a recent binary into /usr/local/bin, which
+# wins over the system one through PATH order.
+pip install patchelf
+# Fail loudly right here if an older patchelf still wins PATH resolution.
+patchelf --version
 
 TORCH_PATH=$(python -c "import torch, os; print(os.path.dirname(torch.__file__))" 2>/dev/null)
 export LD_LIBRARY_PATH="${TORCH_PATH}/lib:${LD_LIBRARY_PATH}"

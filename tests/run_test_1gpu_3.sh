@@ -25,6 +25,8 @@ TESTS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPORTS_DIR="${REPORTS_DIR:-}"
 REPORT_TAG=$(basename "${BASH_SOURCE[0]}" .sh)
 RECORD_SEQ=0
+# 失败目标的路径收进这里，exit_with_summary 统一列出。
+FAILED_TARGETS=()
 
 # 统计本机可见的加速卡数量，探测不出来时返回空串（调用方必须区分“0 张”和“不知道”）。
 # 顺序：显式限卡变量 → torch → 各厂商 smi。容器内 torch 最可靠，因为设备插件只把
@@ -106,8 +108,24 @@ record() {
 
     local rc=0
     "${cmd[@]}" || rc=$?
-    if [ "${rc}" -ne 0 ]; then
+    if [ "${rc}" -eq 5 ]; then
+        # pytest 的 NO_TESTS_COLLECTED：整个目标在 collection 阶段被
+        # module-level skip 掉，属环境门控的正常跳过，不能算用例失败。
+        # rc=1（有用例失败）、2（中断）、3（内部错误）、4（目标路径不存在）
+        # 仍按失败处理，放行 5 不会掩盖真正的错误。
+        echo ">>> SKIPPED (no tests collected): $*"
+    elif [ "${rc}" -ne 0 ]; then
         FAILURES=$((FAILURES + 1))
+        # 汇总行只报数目；具体哪个目标失败由 exit_with_summary 列出，
+        # 所以这里先把目标路径（最后一个 *.py 参数）收进数组。
+        local target="" word
+        for word in "$@"; do
+            case "${word}" in
+                *.py) target="${word}" ;;
+            esac
+        done
+        [ -z "${target}" ] && target="$*"
+        FAILED_TARGETS+=("${target}")
         echo ">>> FAILED (rc=${rc}): $*"
     fi
     return 0
@@ -116,7 +134,11 @@ record() {
 exit_with_summary() {
     local label=$1
     if [ "${FAILURES:-0}" -ne 0 ]; then
-        echo "[${label}] ${FAILURES} 条用例失败"
+        echo "[${label}] ${FAILURES} 个目标失败："
+        local t
+        for t in "${FAILED_TARGETS[@]}"; do
+            echo "    - ${t}"
+        done
         exit 1
     fi
     echo "[${label}] 全部通过"

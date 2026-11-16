@@ -123,7 +123,7 @@ jobs:
     smoke:
         name: Smoke (4 card)
         needs: [decide, build]
-        if: needs.decide.outputs.run == 'true' && github.event_name == 'pull_request'
+        if: needs.decide.outputs.run == 'true' && github.event_name == 'pull_request_target'
         runs-on: hygon-bw1100-4card
         timeout-minutes: 60
         container:
@@ -189,7 +189,7 @@ jobs:
     test-1card:
         name: Test (1 card, ${{ matrix.shard }})
         needs: [decide, build]
-        if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request'
+        if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request_target'
         runs-on: hygon-bw1100-1card
         timeout-minutes: 360
         strategy:
@@ -271,7 +271,7 @@ jobs:
     test-2card:
         name: Test (2 card, ${{ matrix.shard }})
         needs: [decide, build]
-        if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request'
+        if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request_target'
         runs-on: hygon-bw1100-2card
         timeout-minutes: 360
         strategy:
@@ -335,7 +335,7 @@ jobs:
     test-4card:
         name: Test (3-4 card, ${{ matrix.bucket }})
         needs: [decide, build]
-        if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request'
+        if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request_target'
         runs-on: hygon-bw1100-4card
         timeout-minutes: 360
         strategy:
@@ -401,7 +401,7 @@ jobs:
     test-8card:
         name: Test (8 card)
         needs: [decide, build]
-        if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request'
+        if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request_target'
         runs-on: hygon-bw1100-8card
         timeout-minutes: 360
         container:

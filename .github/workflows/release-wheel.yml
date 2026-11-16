@@ -1,0 +1,110 @@
+name: Nightly Wheel
+
+
+on:
+  push:
+    branches:
+      - v0.19.7-dev
+    workflow_dispatch:
+        inputs:     
+            torch-version:
+                description: 'Torch version to test'
+                required: false
+                default: '2.13.0'
+            image:
+                description: 'docker image'
+                required: false
+                default: ''
+            dtk_tag:
+                description: 'dtk tag'
+                required: false
+                default: ''
+
+permissions:
+  contents: read
+  # CIUpload --record 上传前需查询关联 PR (只读)
+  pull-requests: read
+  # CIUpload --record 上报需读取 check-run 统计 (只读)
+  checks: read
+
+concurrency:
+  group: nightly-wheel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-wheel:
+    name: build
+    # 内网 devpi 与镜像仓库只在自托管 runner 可达
+    runs-on: hygon-build
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    # 编译只占 CPU 不占卡,但算子要链接 DTK 和 torch,镜像必须带 DTK 工具链;
+    # 镜像的 glibc 还决定 repair 给 wheel 打的 manylinux 标签。
+    container:
+      image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
+
+    env:
+      PYPI_URL: ${{ vars.PYPI_URL }}
+      # 算子烧进 wheel(compile.sh 用 DS_BUILD_OPS=1),产物绑定 torch 版本;
+      # DTK_VER 只决定归档到 nightly 的哪个目录(das_nightly/dtk<DTK_VER>)。
+      DTK_VER: ${{ github.event.inputs.dtk_tag || '2610' }}
+      # 必须是 job 级:repair 步骤的 CIUpload --torch_version 也要用它,
+      # 而 Setup HCU 步骤里的 step env 跨不了 step。
+      TORCH_VERSION: ${{ github.event.inputs.torch-version || '2.13.0' }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Setup HCU environment
+        env:
+            DEVPI_URL: ${{ vars.DEVPI_URL }}
+            PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}
+            INSTALL_COMPILER: 'true'
+            GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/setup_hcu.sh
+
+      - name: Build wheel
+        run: bash .github/scripts/compile.sh
+
+      - name: repair wheel
+        run: |
+          bash .github/scripts/repair_manylinux.sh
+          pip install ciupload -i https://pypi.sourcefind.cn/release/dtk/
+          mkdir -p repair
+          LOCAL_VER="$(git rev-parse --short=6 HEAD)"
+          CIUpload REPAIR --dtk_version ${DTK_VER} \
+          --torch_version ${TORCH_VERSION} \
+          --git_commit ${LOCAL_VER} \
+          --outputdir repair \
+          -f dist/*.whl
+
+      - name: Upload nightly
+        env:
+          CIUPLOAD_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]]; then
+            CIUpload NIGHTLY \
+              --devpi_url "${PYPI_URL}" \
+              --password "${CIUPLOAD_PASSWORD}" \
+              --dtk_version "${DTK_VER}" \
+              --record \
+              -f repair/*.whl
+          fi
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: adapter-wheels
+          path: dist/*.whl
+          if-no-files-found: error
+
+      # 容器 job 以 root 运行, 会在共享 workspace 留下 root 文件,
+      # 导致同机器上其他 job 的 checkout 失败; 跑完清掉
+      - name: 清理 workspace
+        if: always()
+        run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true

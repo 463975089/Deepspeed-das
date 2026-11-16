@@ -4,84 +4,66 @@
 
 set -euo pipefail
 
-# 生成 manylinux 版本标识
+# The glibc of the build image decides the tag (rocky 8.6 -> manylinux_2_28).
+# The repaired wheel keeps that tag: pip then refuses the install on machines
+# with older glibc instead of failing later at import time with a missing
+# symbol. No tail-stage retagging happens, so auditwheel's work is the product.
 PLATFORM="manylinux_$(ldd --version | awk '{print $NF}' | head -n1 | tr '.' '_')_x86_64"
+
+# The image does not necessarily ship auditwheel; setup_hcu.sh already pointed
+# pip at the devpi index, which serves it.
+pip install auditwheel
+# auditwheel repair hard-requires patchelf >= 0.14.5 and the image carries
+# 0.12. The PyPI package ships a recent binary into /usr/local/bin, which
+# wins over the system one through PATH order.
+pip install patchelf
+# Fail loudly right here if an older patchelf still wins PATH resolution.
+patchelf --version
 
 TORCH_PATH=$(python -c "import torch, os; print(os.path.dirname(torch.__file__))" 2>/dev/null)
 export LD_LIBRARY_PATH="${TORCH_PATH}/lib:${LD_LIBRARY_PATH}"
 
+# Patterns are matched with fnmatch, so each one ends at ".so" + "*" instead of naming a
+# concrete version: a bump like librocblas.so.0 -> .4 or libavcodec.so.58 -> .60 then
+# stays excluded, where a pinned name would silently bundle the library into the wheel.
 auditwheel repair --plat "${PLATFORM}" --strip \
-  --exclude libgalaxyhip.so.5 \
-  --exclude libMIOpen.so.1 \
-  --exclude librccl.so.1 \
-  --exclude libhipblas.so.0 \
-  --exclude libhipfft.so \
-  --exclude libhiprand.so.1 \
-  --exclude libhipsolver.so.0 \
-  --exclude libhipsparse.so.0 \
-  --exclude libhipnn.so \
-  --exclude librocblas.so.0 \
-  --exclude librocsolver.so.0 \
-  --exclude librocfft.so.0 \
-  --exclude librocrand.so.1 \
-  --exclude librocsparse.so.0 \
-  --exclude librocm_smi64.so.2 \
-  --exclude librocfft-device-0.so.0 \
-  --exclude librocfft-device-1.so.0 \
-  --exclude librocfft-device-2.so.0 \
-  --exclude librocfft-device-3.so.0 \
-  --exclude libc10.so \
-  --exclude libc10_hip.so \
-  --exclude libtorch_cpu.so \
-  --exclude libtorch_hip.so \
-  --exclude libtorch_python.so \
-  --exclude libtorch.so \
-  --exclude libtorchaudio_ffmpeg4.so \
-  --exclude libtorchaudio_ffmpeg5.so \
-  --exclude libtorchaudio_ffmpeg6.so \
-  --exclude libtorchaudio.so \
-  --exclude libtorchaudio_sox.so \
-  --exclude _torchaudio_ffmpeg4.so \
-  --exclude _torchaudio_ffmpeg5.so \
-  --exclude _torchaudio_ffmpeg6.so \
-  --exclude _torchaudio.so \
-  --exclude _torchaudio_sox.so \
-  --exclude libavcodec.so.58 \
-  --exclude libavcodec.so.59 \
-  --exclude libavcodec.so.60 \
-  --exclude libavdevice.so.58 \
-  --exclude libavdevice.so.59 \
-  --exclude libavdevice.so.60 \
-  --exclude libavfilter.so.7 \
-  --exclude libavfilter.so.8 \
-  --exclude libavfilter.so.9 \
-  --exclude libavformat.so.58 \
-  --exclude libavformat.so.59 \
-  --exclude libavformat.so.60 \
-  --exclude libavutil.so.56 \
-  --exclude libavutil.so.57 \
-  --exclude libavutil.so.58 \
-  --exclude libsox.so \
-  --exclude libomp.so \
-  --exclude libhipblaslt.so.0 \
-  --exclude libhipblas.so.2 \
-  --exclude libhipfft.so.0 \
-  --exclude libhipsparse.so.1 \
-  --exclude librocblas.so.4 \
-  --exclude librocsparse.so.1 \
+  --exclude 'libgalaxyhip.so*' \
+  --exclude 'libMIOpen.so*' \
+  --exclude 'librccl.so*' \
+  --exclude 'libhipblas.so*' \
+  --exclude 'libhipblaslt.so*' \
+  --exclude 'libhipfft.so*' \
+  --exclude 'libhiprand.so*' \
+  --exclude 'libhipsolver.so*' \
+  --exclude 'libhipsparse.so*' \
+  --exclude 'libhipnn.so*' \
+  --exclude 'librocblas.so*' \
+  --exclude 'librocsolver.so*' \
+  --exclude 'librocfft.so*' \
+  --exclude 'librocfft-device-*.so*' \
+  --exclude 'librocrand.so*' \
+  --exclude 'librocsparse.so*' \
+  --exclude 'librocm_smi64.so*' \
+  --exclude 'libc10*.so*' \
+  --exclude 'libtorch*.so*' \
+  --exclude '_torchaudio*.so*' \
+  --exclude 'libavcodec.so*' \
+  --exclude 'libavdevice.so*' \
+  --exclude 'libavfilter.so*' \
+  --exclude 'libavformat.so*' \
+  --exclude 'libavutil.so*' \
+  --exclude 'libsox.so*' \
+  --exclude 'libomp.so*' \
   --exclude 'libgcvm*' \
   -w dist/ \
   dist/*.whl
 
-cd dist/
-pack=`ls |grep manylinux_2_27`
-wheel unpack ${pack}
-base=$(ls -t|head -n 1)
-cd ${base}
-dir=`ls |grep info`
-sed -i '/manylinux_2_27/d' ${dir}/WHEEL
-cd ../
-wheel pack ${base}
-rm -rf ${base}
-rm -rf ${pack}
-cd ..
+# auditwheel leaves the input wheel next to the repaired one. The deliverable
+# keeps its manylinux tag, so the raw linux_x86_64 build has to go away or
+# CIUpload and the wheel artifact would both receive two files.
+for wheel in dist/*.whl; do
+    case "${wheel}" in
+        *manylinux*) ;;
+        *) rm -f "${wheel}" ;;
+    esac
+done

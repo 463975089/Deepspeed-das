@@ -85,18 +85,21 @@ jobs:
             # --ipc=host or hostPath volumes here.
             image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
         steps:
-            # pull_request already checks out the merge commit; dispatch checks out the branch
-            # picked in the UI and schedule the default branch. A manual pr-number merges on top.
-            - name: Checkout
+            # PR runs test the latest base branch with the PR head merged on top by
+            # setup_hcu.sh; dispatch uses the branch picked in the UI (plus pr-number when given).
+            - name: Checkout base branch
               uses: actions/checkout@v4
               with:
+                ref: ${{ github.event.pull_request.base.ref || github.ref }}
                 fetch-depth: 0
-                persist-credentials: true
+                # Keep the token out of .git/config so PR code cannot read it. The PR
+                # head is merged on top by setup_hcu.sh.
+                persist-credentials: false
 
             - name: Setup HCU environment
               shell: bash
               env:
-                PR_NUMBER: ${{ github.event.inputs.pr-number }}
+                PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr-number }}
                 TORCH_VERSION: ${{ github.event.inputs.torch-version || '2.13.0' }}
                 DEVPI_URL: ${{ vars.DEVPI_URL }}
                 PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}
@@ -132,16 +135,19 @@ jobs:
             HIP_VISIBLE_DEVICES: 0,1,2,3
             CUDA_VISIBLE_DEVICES: 0,1,2,3
         steps:
-            - name: Checkout
+            - name: Checkout base branch
               uses: actions/checkout@v4
               with:
+                ref: ${{ github.event.pull_request.base.ref || github.ref }}
                 fetch-depth: 0
-                persist-credentials: true
+                # Keep the token out of .git/config so PR code cannot read it. The PR
+                # head is merged on top by setup_hcu.sh.
+                persist-credentials: false
 
             - name: Setup HCU environment
               shell: bash
               env:
-                PR_NUMBER: ${{ github.event.inputs.pr-number }}
+                PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr-number }}
                 TORCH_VERSION: ${{ github.event.inputs.torch-version || '2.13.0' }}
                 DEVPI_URL: ${{ vars.DEVPI_URL }}
                 PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}
@@ -191,7 +197,7 @@ jobs:
         needs: [decide, build]
         if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request_target'
         runs-on: hygon-bw1100-1card
-        timeout-minutes: 720
+        timeout-minutes: 360
         strategy:
             # A failing shard must not cancel its siblings: the point of splitting is that
             # every target still reports a result.
@@ -204,16 +210,19 @@ jobs:
             HIP_VISIBLE_DEVICES: 0
             CUDA_VISIBLE_DEVICES: 0
         steps:
-            - name: Checkout
+            - name: Checkout base branch
               uses: actions/checkout@v4
               with:
+                ref: ${{ github.event.pull_request.base.ref || github.ref }}
                 fetch-depth: 0
-                persist-credentials: true
+                # Keep the token out of .git/config so PR code cannot read it. The PR
+                # head is merged on top by setup_hcu.sh.
+                persist-credentials: false
 
             - name: Setup HCU environment
               shell: bash
               env:
-                PR_NUMBER: ${{ github.event.inputs.pr-number }}
+                PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr-number }}
                 TORCH_VERSION: ${{ github.event.inputs.torch-version || '2.13.0' }}
                 DEVPI_URL: ${{ vars.DEVPI_URL }}
                 PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}
@@ -262,7 +271,7 @@ jobs:
         needs: [decide, build]
         if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request_target'
         runs-on: hygon-bw1100-2card
-        timeout-minutes: 720
+        timeout-minutes: 360
         strategy:
             fail-fast: false
             matrix:
@@ -273,16 +282,19 @@ jobs:
             HIP_VISIBLE_DEVICES: 0,1
             CUDA_VISIBLE_DEVICES: 0,1
         steps:
-            - name: Checkout
+            - name: Checkout base branch
               uses: actions/checkout@v4
               with:
+                ref: ${{ github.event.pull_request.base.ref || github.ref }}
                 fetch-depth: 0
-                persist-credentials: true
+                # Keep the token out of .git/config so PR code cannot read it. The PR
+                # head is merged on top by setup_hcu.sh.
+                persist-credentials: false
 
             - name: Setup HCU environment
               shell: bash
               env:
-                PR_NUMBER: ${{ github.event.inputs.pr-number }}
+                PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr-number }}
                 TORCH_VERSION: ${{ github.event.inputs.torch-version || '2.13.0' }}
                 DEVPI_URL: ${{ vars.DEVPI_URL }}
                 PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}
@@ -326,23 +338,26 @@ jobs:
         needs: [decide, build]
         if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request_target'
         runs-on: hygon-bw1100-4card
-        timeout-minutes: 720
+        timeout-minutes: 360
         container:
             image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
         env:
             HIP_VISIBLE_DEVICES: 0,1,2,3
             CUDA_VISIBLE_DEVICES: 0,1,2,3
         steps:
-            - name: Checkout
+            - name: Checkout base branch
               uses: actions/checkout@v4
               with:
+                ref: ${{ github.event.pull_request.base.ref || github.ref }}
                 fetch-depth: 0
-                persist-credentials: true
+                # Keep the token out of .git/config so PR code cannot read it. The PR
+                # head is merged on top by setup_hcu.sh.
+                persist-credentials: false
 
             - name: Setup HCU environment
               shell: bash
               env:
-                PR_NUMBER: ${{ github.event.inputs.pr-number }}
+                PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr-number }}
                 TORCH_VERSION: ${{ github.event.inputs.torch-version || '2.13.0' }}
                 DEVPI_URL: ${{ vars.DEVPI_URL }}
                 PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}
@@ -395,16 +410,19 @@ jobs:
             HIP_VISIBLE_DEVICES: 0,1,2,3,4,5,6,7
             CUDA_VISIBLE_DEVICES: 0,1,2,3,4,5,6,7
         steps:
-            - name: Checkout
+            - name: Checkout base branch
               uses: actions/checkout@v4
               with:
+                ref: ${{ github.event.pull_request.base.ref || github.ref }}
                 fetch-depth: 0
-                persist-credentials: true
+                # Keep the token out of .git/config so PR code cannot read it. The PR
+                # head is merged on top by setup_hcu.sh.
+                persist-credentials: false
 
             - name: Setup HCU environment
               shell: bash
               env:
-                PR_NUMBER: ${{ github.event.inputs.pr-number }}
+                PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr-number }}
                 TORCH_VERSION: ${{ github.event.inputs.torch-version || '2.13.0' }}
                 DEVPI_URL: ${{ vars.DEVPI_URL }}
                 PIP_TRUSTED_HOST: ${{ vars.PIP_TRUSTED_HOST }}

@@ -32,22 +32,6 @@ if [ "1" -ge "$START" ]; then
     fi
 fi
 
-if [ "1" -ge "$START" ]; then
-    echo "[run_test_all] === run_test_1gpu_3.sh ==="
-    if ! "${TESTS_DIR}/run_test_1gpu_3.sh"; then
-        FAILURES=$((FAILURES + 1))
-        echo "[run_test_all] run_test_1gpu_3.sh FAILED"
-    fi
-fi
-
-if [ "1" -ge "$START" ]; then
-    echo "[run_test_all] === run_test_1gpu_4.sh ==="
-    if ! "${TESTS_DIR}/run_test_1gpu_4.sh"; then
-        FAILURES=$((FAILURES + 1))
-        echo "[run_test_all] run_test_1gpu_4.sh FAILED"
-    fi
-fi
-
 if [ "2" -ge "$START" ]; then
     echo "[run_test_all] === run_test_2gpu_1.sh ==="
     if ! "${TESTS_DIR}/run_test_2gpu_1.sh"; then
@@ -61,14 +45,6 @@ if [ "2" -ge "$START" ]; then
     if ! "${TESTS_DIR}/run_test_2gpu_2.sh"; then
         FAILURES=$((FAILURES + 1))
         echo "[run_test_all] run_test_2gpu_2.sh FAILED"
-    fi
-fi
-
-if [ "3" -ge "$START" ]; then
-    echo "[run_test_all] === run_test_3gpu.sh ==="
-    if ! "${TESTS_DIR}/run_test_3gpu.sh"; then
-        FAILURES=$((FAILURES + 1))
-        echo "[run_test_all] run_test_3gpu.sh FAILED"
     fi
 fi
 

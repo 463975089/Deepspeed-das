@@ -5,12 +5,16 @@
 # Do not edit by hand; edit run_test.sh and regenerate instead.
 
 #
-# Tests that need at most 1 GPU(s), shard 1 of 4.
+# Tests that need at most 1 GPU(s), shard 1 of 2.
 # The shards of one bucket are disjoint; the CI matrix runs them in
 # parallel and together they cover every target exactly once.
 #
-# transformers: no target here asserts a floor; any release that satisfies
-# requirements/requirements-dev.txt (>= 4.51.3) is enough.
+# transformers floor for this shard: >= 5.0.0
+#   >= 5.0.0  unit/v1/moe/test_autoep_unit.py
+#
+# Class-gated (these skip themselves if the installed transformers lacks
+# the model class they probe):
+#   unit/v1/moe/test_autoep_unit.py
 
 set -uo pipefail
 
@@ -197,5 +201,54 @@ record pytest --timeout=1400 ./unit/ops/quantizer/test_fake_quantization.py
 record pytest --timeout=1400 ./unit/ops/quantizer/test_quantize.py
 record pytest --timeout=1400 ./unit/ops/lion/test_lion.py
 record pytest --timeout=1400 ./unit/ops/adam/test_adamw.py
+record pytest --timeout=1400 ./unit/ops/adam/test_hybrid_adam.py
+record pytest --timeout=1400 ./unit/ops/adam/test_zf_torch_adam.py
+record pytest --timeout=1400 ./unit/ops/transformer/inference/test_attention.py
+record pytest --timeout=1400 ./unit/ops/transformer/inference/test_softmax.py
+record pytest --timeout=1400 ./unit/ops/transformer/inference/test_moe_res_matmult.py
+record pytest --timeout=1400 ./unit/ops/transformer/inference/test_bias_gelu.py
+record pytest --timeout=1400 ./unit/ops/transformer/inference/test_layer_norm.py
+record pytest --timeout=1400 ./unit/ops/transformer/inference/test_bias_geglu.py
+record pytest --timeout=1400 ./unit/ops/transformer/inference/test_bias_relu.py
+record pytest --timeout=1400 ./unit/ops/transformer/inference/test_bias_add.py
+record pytest --timeout=1400 ./unit/ops/transformer/inference/test_residual_add.py
+record pytest --timeout=1400 ./unit/ops/transformer/inference/test_gelu.py
+record pytest --timeout=1400 ./unit/ops/transformer/inference/test_matmul.py
+record pytest --timeout=1400 ./unit/ops/transformer/inference/test_rms_norm.py
+record pytest --timeout=1400 ./unit/ops/transformer/inference/test_rope.py
+record pytest --timeout=1400 ./unit/hybrid_engine/test_he_all.py
+record pytest --timeout=1400 ./unit/hybrid_engine/test_he_lora.py
+record pytest --timeout=1400 ./unit/hybrid_engine/test_he_llama.py
+record pytest --timeout=1400 ./unit/inference/v2/kernels/core_ops/test_pre_ln.py
+record pytest --timeout=1400 ./unit/inference/v2/kernels/core_ops/test_post_ln.py
+record pytest --timeout=1400 ./unit/inference/v2/kernels/core_ops/test_blas_linear.py
+record pytest --timeout=1400 ./unit/inference/v2/kernels/core_ops/test_gated_activation.py
+record pytest --timeout=1400 ./unit/inference/v2/kernels/core_ops/test_bias_activation.py
+record pytest --timeout=1400 ./unit/inference/v2/kernels/core_ops/test_rms_norm.py
+record pytest --timeout=1400 ./unit/inference/v2/kernels/ragged_ops/test_atom_builder.py
+record pytest --timeout=1400 ./unit/inference/v2/kernels/ragged_ops/test_moe_scatter.py
+record pytest --timeout=1400 ./unit/inference/v2/kernels/ragged_ops/test_logits_gather.py
+record pytest --timeout=1400 ./unit/inference/v2/kernels/ragged_ops/test_ragged_embed.py
+record python ./perf/adagrad_test.py
+record python ./perf/adam_test.py
+record python ./small_model_debugging/partial_offload_test.py
+record pytest --timeout=1400 ./unit/compile/test_inductor_aot_kwargs.py
+record pytest --timeout=1400 ./unit/compile/test_zero3_grad_dtype.py
+record pytest --timeout=1400 ./unit/linear/test_quant_param.py
+record pytest --timeout=1400 ./unit/module_inject/test_tp_plan_converter.py
+record pytest --timeout=1400 ./unit/v1/nvme/test_fast_file_writer_fd_close.py
+record pytest --timeout=1400 ./unit/ops/deepspeed4science/test_evoformer_attn_builder.py
+record pytest --timeout=1400 ./unit/ops/test_op_builder.py
+record pytest --timeout=1400 ./unit/runtime/half_precision/test_fp8.py
+record pytest --timeout=1400 ./unit/runtime/tensor_parallel/test_autotp_universal_checkpoint.py
+record pytest --timeout=1400 ./unit/runtime/test_precision_config_loss_scale.py
+record pytest --timeout=1400 ./unit/runtime/test_tp_plan_extraction.py
+record pytest --timeout=1400 ./unit/runtime/zero/test_zero_late_module_attach.py
+record pytest --timeout=1400 ./unit/v1/compile/test_compile_fx.py
+record pytest --timeout=1400 ./unit/v1/compile/test_selective_gather.py
+record pytest --timeout=1400 ./unit/v1/half_precision/test_mixed_precision_dtype.py
+# transformers >= 5.0.0
+record pytest --timeout=1400 ./unit/v1/moe/test_autoep_unit.py
+record pytest --timeout=1400 ./unit/v1/moe/test_fused_expert_layout.py
 
-exit_with_summary "1-GPU bucket, shard 1 of 4"
+exit_with_summary "1-GPU bucket, shard 1 of 2"

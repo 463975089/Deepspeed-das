@@ -177,27 +177,27 @@ jobs:
                 source /opt/dtk/env.sh
                 bash tests/run_test_smoke.sh
 
-    # Full suite, split by card count. run_test_<N>gpu.sh holds exactly the targets whose
-    # maximum world_size is N, and the 1-GPU/2-GPU buckets are further split into shard
-    # scripts that matrix runs in parallel (the split lives in tests/gen_run_test_buckets.py;
-    # keep both sides in sync). Shard counts stay within each pool's maxRunners: extra
-    # shards would only queue.
-    #   1card  197 targets, maxRunners 8 -> 4 shards
+    # Full suite, split by card count. run_test_<N>gpu.sh holds the targets whose maximum
+    # world_size is N (the 3-GPU targets are folded into run_test_4gpu.sh), and the
+    # 1-GPU/2-GPU buckets are further split into shard scripts that matrix runs in
+    # parallel (the split lives in tests/gen_run_test_buckets.py; keep both sides in sync).
+    # Shard counts stay within each pool's maxRunners: extra shards would only queue.
+    #   1card  197 targets, maxRunners 8 -> 2 shards
     #   2card   62 targets, maxRunners 2 -> 2 shards
-    #   4card   26 targets, maxRunners 2 -> one job per bucket script
+    #   4card   26 targets, maxRunners 2 -> one job (3-GPU targets ride along)
     #   8card    5 targets, maxRunners 1 -> one job
     test-1card:
         name: Test (1 card, ${{ matrix.shard }})
         needs: [decide, build]
         if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request_target'
         runs-on: hygon-bw1100-1card
-        timeout-minutes: 360
+        timeout-minutes: 720
         strategy:
             # A failing shard must not cancel its siblings: the point of splitting is that
             # every target still reports a result.
             fail-fast: false
             matrix:
-                shard: ['1', '2', '3', '4']
+                shard: ['1', '2']
         container:
             image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
         env:
@@ -244,19 +244,8 @@ jobs:
                 source /opt/dtk/env.sh
                 bash tests/run_test_1gpu_${{ matrix.shard }}.sh
 
-            # test_model_profiling uses the pipeline framework= switch, which transformers
-            # 5.x removed, so the main suite cannot run it with the pinned release. A
-            # dedicated step installs the newest 4.x for just this test; the version swap
-            # dies with the job and never touches the rest of the shard.
-            - name: Run inference test on legacy transformers
-              if: matrix.shard == '2'
-              shell: bash
-              run: |
-                source /opt/dtk/env.sh
-                pip install "transformers~=4.57.0"
-                cd tests
-                pytest --timeout=1400 ./unit/inference/test_model_profiling.py                     --junitxml="${REPORTS_DIR}/legacy-inference.xml"
-
+            # The two targets that need an older transformers version swap it in
+            # themselves at the end of the last 1-GPU shard (see gen_run_test_buckets.py).
             # The bucket scripts skip themselves when the pod has fewer cards than they
             # need, and exit non-zero if any of their targets failed.
             - name: Upload test reports
@@ -273,7 +262,7 @@ jobs:
         needs: [decide, build]
         if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request_target'
         runs-on: hygon-bw1100-2card
-        timeout-minutes: 360
+        timeout-minutes: 720
         strategy:
             fail-fast: false
             matrix:
@@ -333,16 +322,11 @@ jobs:
                 if-no-files-found: ignore
 
     test-4card:
-        name: Test (3-4 card, ${{ matrix.bucket }})
+        name: Test (3-4 card)
         needs: [decide, build]
         if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request_target'
         runs-on: hygon-bw1100-4card
-        timeout-minutes: 360
-        strategy:
-            fail-fast: false
-            matrix:
-                # No 3-card pool exists; a 4-card pod runs the 3-card bucket with one card idle.
-                bucket: ['3gpu', '4gpu']
+        timeout-minutes: 720
         container:
             image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
         env:
@@ -383,17 +367,18 @@ jobs:
                 pip install "transformers==${TRANSFORMERS_VERSION}"
                 pip install dist/*.whl
 
+            # No 3-card pool exists; the 3-GPU targets are folded into run_test_4gpu.sh.
             - name: Run tests
               shell: bash
               run: |
                 source /opt/dtk/env.sh
-                bash tests/run_test_${{ matrix.bucket }}.sh
+                bash tests/run_test_4gpu.sh
 
             - name: Upload test reports
               if: always()
               uses: actions/upload-artifact@v4
               with:
-                name: hcu-test-reports-${{ matrix.bucket }}-${{ github.run_id }}
+                name: hcu-test-reports-4card-${{ github.run_id }}
                 path: ${{ env.REPORTS_DIR }}
                 if-no-files-found: ignore
 

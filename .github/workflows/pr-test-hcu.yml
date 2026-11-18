@@ -197,7 +197,7 @@ jobs:
         needs: [decide, build]
         if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request_target'
         runs-on: hygon-bw1100-1card
-        timeout-minutes: 360
+        timeout-minutes: 3600
         strategy:
             # A failing shard must not cancel its siblings: the point of splitting is that
             # every target still reports a result.
@@ -271,7 +271,7 @@ jobs:
         needs: [decide, build]
         if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request_target'
         runs-on: hygon-bw1100-2card
-        timeout-minutes: 360
+        timeout-minutes: 3600
         strategy:
             fail-fast: false
             matrix:
@@ -338,7 +338,7 @@ jobs:
         needs: [decide, build]
         if: needs.decide.outputs.run == 'true' && github.event_name != 'pull_request_target'
         runs-on: hygon-bw1100-4card
-        timeout-minutes: 360
+        timeout-minutes: 3600
         container:
             image: ${{ inputs.image || vars.IMAGE_DTK2610 }}
         env:

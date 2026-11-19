@@ -111,7 +111,7 @@ elif [[ -n "$MAJOR" ]]; then
     fi
 else
     # 默认: 版本号最高, 该版本内取日期最新
-    pick=$(sort -k2,2Vr -k1,1r /tmp/dtk_candidates.$$ | head -1)
+    pick=$(sort -k2,2Vr -k1,1r /tmp/dtk_candidates.$$ | sed -n '1p')
 fi
 rm -f /tmp/dtk_candidates.$$
 

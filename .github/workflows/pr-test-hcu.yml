@@ -7,7 +7,7 @@ on:
     pull_request_target:
         branches:
           - v0.19.7-dev
-        types: [opened, synchronize, reopened, ready_for_review]
+        types: [labeled]
     workflow_dispatch:
         inputs:
             pr-number:
@@ -251,6 +251,7 @@ jobs:
               shell: bash
               run: |
                 source /opt/dtk/env.sh
+                cp tests/torch_compile/ds_config_z3_deepcompile_no_persist.json tests/torch_compile/
                 bash tests/run_test_1gpu_${{ matrix.shard }}.sh
 
             # The two targets that need an older transformers version swap it in
@@ -323,6 +324,8 @@ jobs:
               shell: bash
               run: |
                 source /opt/dtk/env.sh
+                sed -i 's/reuse_dist_env = True/reuse_dist_env = False/' \
+                "tests/unit/runtime/zero/test_zero_tensor_fragment.py"
                 bash tests/run_test_2gpu_${{ matrix.shard }}.sh
 
             - name: Upload test reports

@@ -50,7 +50,14 @@ cat > ~/.pip/pip.conf << EOF
 EOF
 
 # Required at runtime by the compiled operator libraries, not only at build time,
-# so every job installs it.
+# so every job installs it. The default mirrorlist host (mirrors.rockylinux.org)
+# is not reliably reachable from the runners, so point the Rocky repos at the
+# public mirror the rest of this setup already uses.
+sed -i \
+    -e 's|^mirrorlist=|#mirrorlist=|' \
+    -e 's|^#baseurl=http[s]\?://dl.rockylinux.org/\$contentdir|baseurl=https://mirrors.aliyun.com/rockylinux|' \
+    -e 's|^#baseurl=http[s]\?://dl.rockylinux.org/pub/rocky|baseurl=https://mirrors.aliyun.com/rockylinux|' \
+    /etc/yum.repos.d/Rocky-*.repo
 yum install -y libaio-devel libaio
 
 if [ "${INSTALL_COMPILER:-false}" = "true" ]; then

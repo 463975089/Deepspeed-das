@@ -6,6 +6,7 @@
 
 import argparse
 import logging
+import os
 
 import torch
 
@@ -56,7 +57,10 @@ def main():
     configure_dynamo_logging()
     parser = argparse.ArgumentParser()
     parser.add_argument("--local_rank", type=int, default=-1)
-    parser.add_argument("--deepspeed_config", type=str, default="ds_config_z3_deepcompile_no_persist.json")
+    parser.add_argument("--deepspeed_config",
+                        type=str,
+                        default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                             "ds_config_z3_deepcompile_no_persist.json"))
     args = parser.parse_args()
 
     model = SkippedFrameModel()

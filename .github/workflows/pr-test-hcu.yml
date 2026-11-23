@@ -74,7 +74,12 @@ jobs:
     build:
         name: Build wheel
         needs: decide
-        if: needs.decide.outputs.run == 'true'
+        # PR runs only start after a maintainer adds the `run-ci` label; manual dispatch
+        # and nightly runs are trusted and do not need it.
+        if: >-
+            needs.decide.outputs.run == 'true' &&
+            (github.event_name != 'pull_request_target' ||
+             github.event.label.name == 'run-ci')
         runs-on: hygon-build
         # Compiling plus the full dependency install. The pool's own 15-minute resource wait
         # is counted separately by the scheduler.

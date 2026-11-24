@@ -77,6 +77,8 @@ jobs:
     build:
         name: Build wheel
         needs: decide
+        outputs:
+           wheel_dir: ${{ steps.stage.outputs.wheel_dir }}
         # PR runs only start after a maintainer adds the `run-ci` label; manual dispatch
         # and nightly runs are trusted and do not need it.
         if: >-
@@ -119,14 +121,22 @@ jobs:
               shell: bash
               run: bash .github/scripts/compile.sh
 
-            # Each test job runs in its own container with no shared state, so the wheel has
-            # to travel as an artifact.
-            - name: Upload wheel
-              uses: actions/upload-artifact@v4
-              with:
-                name: deepspeed-wheel
-                path: dist/*.whl
-                retention-days: 1
+            # Each test job runs in its own container, so the built wheel is staged under
+            # the shared /ci_public mount that every runner pool must expose at this path.
+            - name: Stage wheel
+              id: stage
+              shell: bash
+              run: |
+                GIT_COMMIT="$(git rev-parse --short=6 HEAD)"
+                REPO_NAME="${GITHUB_REPOSITORY#*/}"
+                STAGING_ROOT="/ci_public/Deepspeed-das/hcu-wheel-staging"
+                STAGING_DIR="${STAGING_ROOT}/${GITHUB_REPOSITORY_OWNER}_${REPO_NAME}/run-${GITHUB_RUN_ID}/${GIT_COMMIT}"
+                WHEEL_DIR="${STAGING_DIR}/wheels"
+                # 单独重跑 build 时先清掉上一次的 whl，免得目录里同名包有两个版本
+                rm -rf "$WHEEL_DIR" && mkdir -p "$WHEEL_DIR"
+                cp dist/*.whl "$WHEEL_DIR"/
+                ls -l "$WHEEL_DIR"
+                echo "wheel_dir=$WHEEL_DIR" >> "$GITHUB_OUTPUT"
 
     # PR validation runs the smoke subset only: the full suite takes hours and belongs to
     # the nightly. run_test_smoke.sh includes unit/comm/test_dist.py::TestInit, whose
@@ -142,6 +152,7 @@ jobs:
         env:
             HIP_VISIBLE_DEVICES: 0,1,2,3
             CUDA_VISIBLE_DEVICES: 0,1,2,3
+            WHEEL_DIR: ${{ needs.build.outputs.wheel_dir }}
         steps:
             - name: Checkout base branch
               uses: actions/checkout@v4
@@ -165,11 +176,6 @@ jobs:
                 GH_TOKEN: ${{ github.token }}
               run: bash .github/scripts/setup_hcu.sh
 
-            - name: Download wheel
-              uses: actions/download-artifact@v4
-              with:
-                name: deepspeed-wheel
-                path: dist
 
             # Test jobs need the Python dependencies but must not rebuild the operators.
             # compile.sh installs an unpinned transformers, so pin it back to the version the
@@ -183,7 +189,11 @@ jobs:
                 source /opt/dtk/env.sh
                 bash .github/scripts/compile.sh --deps-only
                 pip install "transformers==${TRANSFORMERS_VERSION}"
-                pip install dist/*.whl
+                if ! ls "${WHEEL_DIR}"/*.whl >/dev/null 2>&1; then
+                    echo "[error] no wheel under ${WHEEL_DIR}; is /ci_public mounted on this pool?" >&2
+                    exit 1
+                fi
+                pip install ${WHEEL_DIR}/*.whl
 
             - name: Run smoke tests
               shell: bash
@@ -217,6 +227,7 @@ jobs:
         env:
             HIP_VISIBLE_DEVICES: 0
             CUDA_VISIBLE_DEVICES: 0
+            WHEEL_DIR: ${{ needs.build.outputs.wheel_dir }}
         steps:
             - name: Checkout base branch
               uses: actions/checkout@v4
@@ -238,12 +249,6 @@ jobs:
                 GH_TOKEN: ${{ github.token }}
               run: bash .github/scripts/setup_hcu.sh
 
-            - name: Download wheel
-              uses: actions/download-artifact@v4
-              with:
-                name: deepspeed-wheel
-                path: dist
-
             - name: Install dependencies and wheel
               shell: bash
               env:
@@ -253,13 +258,16 @@ jobs:
                 source /opt/dtk/env.sh
                 bash .github/scripts/compile.sh --deps-only
                 pip install "transformers==${TRANSFORMERS_VERSION}"
-                pip install dist/*.whl
+                if ! ls "${WHEEL_DIR}"/*.whl >/dev/null 2>&1; then
+                    echo "[error] no wheel under ${WHEEL_DIR}; is /ci_public mounted on this pool?" >&2
+                    exit 1
+                fi
+                pip install ${WHEEL_DIR}/*.whl
 
             - name: Run tests
               shell: bash
               run: |
                 source /opt/dtk/env.sh
-                cp tests/torch_compile/ds_config_z3_deepcompile_no_persist.json tests/torch_compile/
                 bash tests/run_test_1gpu_${{ matrix.shard }}.sh
 
             # The two targets that need an older transformers version swap it in
@@ -290,6 +298,7 @@ jobs:
         env:
             HIP_VISIBLE_DEVICES: 0,1
             CUDA_VISIBLE_DEVICES: 0,1
+            WHEEL_DIR: ${{ needs.build.outputs.wheel_dir }}
         steps:
             - name: Checkout base branch
               uses: actions/checkout@v4
@@ -311,12 +320,6 @@ jobs:
                 GH_TOKEN: ${{ github.token }}
               run: bash .github/scripts/setup_hcu.sh
 
-            - name: Download wheel
-              uses: actions/download-artifact@v4
-              with:
-                name: deepspeed-wheel
-                path: dist
-
             - name: Install dependencies and wheel
               shell: bash
               env:
@@ -326,7 +329,11 @@ jobs:
                 source /opt/dtk/env.sh
                 bash .github/scripts/compile.sh --deps-only
                 pip install "transformers==${TRANSFORMERS_VERSION}"
-                pip install dist/*.whl
+                if ! ls "${WHEEL_DIR}"/*.whl >/dev/null 2>&1; then
+                    echo "[error] no wheel under ${WHEEL_DIR}; is /ci_public mounted on this pool?" >&2
+                    exit 1
+                fi
+                pip install ${WHEEL_DIR}/*.whl
 
             - name: Run tests
               shell: bash
@@ -355,6 +362,7 @@ jobs:
         env:
             HIP_VISIBLE_DEVICES: 0,1,2,3
             CUDA_VISIBLE_DEVICES: 0,1,2,3
+            WHEEL_DIR: ${{ needs.build.outputs.wheel_dir }}
         steps:
             - name: Checkout base branch
               uses: actions/checkout@v4
@@ -376,12 +384,6 @@ jobs:
                 GH_TOKEN: ${{ github.token }}
               run: bash .github/scripts/setup_hcu.sh
 
-            - name: Download wheel
-              uses: actions/download-artifact@v4
-              with:
-                name: deepspeed-wheel
-                path: dist
-
             - name: Install dependencies and wheel
               shell: bash
               env:
@@ -391,7 +393,11 @@ jobs:
                 source /opt/dtk/env.sh
                 bash .github/scripts/compile.sh --deps-only
                 pip install "transformers==${TRANSFORMERS_VERSION}"
-                pip install dist/*.whl
+                if ! ls "${WHEEL_DIR}"/*.whl >/dev/null 2>&1; then
+                    echo "[error] no wheel under ${WHEEL_DIR}; is /ci_public mounted on this pool?" >&2
+                    exit 1
+                fi
+                pip install ${WHEEL_DIR}/*.whl
 
             # No 3-card pool exists; the 3-GPU targets are folded into run_test_4gpu.sh.
             - name: Run tests
@@ -420,6 +426,7 @@ jobs:
         env:
             HIP_VISIBLE_DEVICES: 0,1,2,3,4,5,6,7
             CUDA_VISIBLE_DEVICES: 0,1,2,3,4,5,6,7
+            WHEEL_DIR: ${{ needs.build.outputs.wheel_dir }}
         steps:
             - name: Checkout base branch
               uses: actions/checkout@v4
@@ -441,12 +448,6 @@ jobs:
                 GH_TOKEN: ${{ github.token }}
               run: bash .github/scripts/setup_hcu.sh
 
-            - name: Download wheel
-              uses: actions/download-artifact@v4
-              with:
-                name: deepspeed-wheel
-                path: dist
-
             - name: Install dependencies and wheel
               shell: bash
               env:
@@ -456,7 +457,11 @@ jobs:
                 source /opt/dtk/env.sh
                 bash .github/scripts/compile.sh --deps-only
                 pip install "transformers==${TRANSFORMERS_VERSION}"
-                pip install dist/*.whl
+                if ! ls "${WHEEL_DIR}"/*.whl >/dev/null 2>&1; then
+                    echo "[error] no wheel under ${WHEEL_DIR}; is /ci_public mounted on this pool?" >&2
+                    exit 1
+                fi
+                pip install ${WHEEL_DIR}/*.whl
 
             - name: Run tests
               shell: bash

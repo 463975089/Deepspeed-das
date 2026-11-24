@@ -8,6 +8,9 @@ on:
         branches:
           - v0.19.7-dev
         types: [labeled]
+        # PRs that only touch CI config need no run; touching any other file still runs.
+        paths-ignore:
+          - '.github/**'
     workflow_dispatch:
         inputs:
             pr-number:
